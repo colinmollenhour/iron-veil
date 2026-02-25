@@ -20,6 +20,18 @@ type HealthResponse = {
   }
 }
 
+type ConfigResponse = {
+  masking_enabled: boolean
+  rules_count: number
+}
+
+async function parseJsonResponse<T>(res: Response, endpoint: string): Promise<T> {
+  if (!res.ok) {
+    throw new Error(`Request to ${endpoint} failed with status ${res.status}`)
+  }
+  return (await res.json()) as T
+}
+
 function formatProtocolLabel(protocol: string | null): string {
   if (!protocol) {
     return "Unknown"
@@ -50,7 +62,10 @@ export default function SettingsPage() {
   const fetchConfig = async () => {
     try {
       const res = await apiFetch("/config")
-      const data = await res.json()
+      const data = await parseJsonResponse<ConfigResponse>(res, "/config")
+      if (typeof data.masking_enabled !== "boolean" || typeof data.rules_count !== "number") {
+        throw new Error("Invalid /config response shape")
+      }
       setConfig(data)
     } catch (error) {
       console.error("Failed to fetch config", error)
@@ -62,7 +77,7 @@ export default function SettingsPage() {
   const fetchHealth = async () => {
     try {
       const res = await apiFetch("/health")
-      const data = (await res.json()) as HealthResponse
+      const data = await parseJsonResponse<HealthResponse>(res, "/health")
       setVersion(data?.version ?? null)
       setUpstreamHost(data?.upstream?.host ?? null)
       setUpstreamPort(typeof data?.upstream?.port === "number" ? data.upstream.port : null)
@@ -110,8 +125,12 @@ export default function SettingsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ masking_enabled: !config.masking_enabled })
       })
-      const data = await res.json()
-      setConfig(prev => prev ? { ...prev, masking_enabled: data.masking_enabled } : null)
+      const data = await parseJsonResponse<{ masking_enabled?: unknown }>(res, "/config")
+      if (typeof data.masking_enabled !== "boolean") {
+        throw new Error("Invalid /config update response shape")
+      }
+      const maskingEnabled = data.masking_enabled
+      setConfig(prev => prev ? { ...prev, masking_enabled: maskingEnabled } : null)
     } catch (error) {
       console.error("Failed to update config", error)
     } finally {
@@ -122,7 +141,7 @@ export default function SettingsPage() {
   const handleExport = async () => {
     try {
       const res = await apiFetch("/rules")
-      const data = await res.json()
+      const data = await parseJsonResponse<Record<string, unknown>>(res, "/rules")
       
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
       const url = window.URL.createObjectURL(blob)

@@ -15,10 +15,14 @@ jest.mock("framer-motion", () => ({
 }))
 
 type FetchResponse = {
+  ok: boolean
+  status: number
   json: () => Promise<unknown>
 }
 
-const createResponse = (data: unknown): FetchResponse => ({
+const createResponse = (data: unknown, ok = true): FetchResponse => ({
+  ok,
+  status: ok ? 200 : 500,
   json: async () => data
 })
 
@@ -95,6 +99,37 @@ describe("SettingsPage", () => {
       "http://localhost:3001/config",
       expect.objectContaining({ method: "POST" })
     )
+  })
+
+  it("keeps masking state unchanged when POST /config fails", async () => {
+    const user = userEvent.setup()
+    const fetchMock = global.fetch as jest.Mock
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {})
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.endsWith("/config") && !init?.method) {
+        return createResponse({ masking_enabled: true, rules_count: 3 }) as Response
+      }
+      if (url.endsWith("/config") && init?.method === "POST") {
+        return createResponse({ error: "update failed" }, false) as Response
+      }
+      if (url.endsWith("/health")) {
+        return createResponse({ version: "1.2.3" }) as Response
+      }
+      if (url.endsWith("/rules")) {
+        return createResponse({ rules: [{ id: "1" }] }) as Response
+      }
+      return createResponse({}) as Response
+    })
+
+    render(<SettingsPage />)
+    const switches = await screen.findAllByRole("switch")
+    await user.click(switches[0])
+
+    await waitFor(() => {
+      expect(screen.getByText("Active")).toBeInTheDocument()
+    })
+    errorSpy.mockRestore()
   })
 
   it("exports configuration data", async () => {
