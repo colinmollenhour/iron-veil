@@ -137,6 +137,21 @@ The dashboard connects to the IronVeil Management API:
 | `/schema` | POST | Get database schema (requires DB credential payload; PostgreSQL scanner currently) |
 | `/audit` | GET | Get audit logs |
 
+`GET /health` includes upstream runtime metadata consumed by the settings/dashboard UI:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "upstream": {
+    "host": "localhost",
+    "port": 5432,
+    "protocol": "postgres",
+    "healthy": true
+  }
+}
+```
+
 ### Scan/Schema Payload
 
 ```json

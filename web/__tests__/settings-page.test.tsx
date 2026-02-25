@@ -36,7 +36,14 @@ describe("SettingsPage", () => {
       }
 
       if (url.endsWith("/health")) {
-        return createResponse({ version: "1.2.3" }) as Response
+        return createResponse({
+          version: "1.2.3",
+          upstream: {
+            host: "db.internal",
+            port: 6432,
+            protocol: "mysql",
+          },
+        }) as Response
       }
 
       if (url.endsWith("/rules")) {
@@ -66,6 +73,9 @@ describe("SettingsPage", () => {
     expect(await screen.findByText("Settings")).toBeInTheDocument()
     expect(await screen.findByText("Active")).toBeInTheDocument()
     expect(await screen.findByText("1.2.3")).toBeInTheDocument()
+    expect(await screen.findByText("db.internal")).toBeInTheDocument()
+    expect(await screen.findByText("6432")).toBeInTheDocument()
+    expect(await screen.findByText("MySQL")).toBeInTheDocument()
     expect(await screen.findByText("3")).toBeInTheDocument()
   })
 

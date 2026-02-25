@@ -1,7 +1,7 @@
 use crate::audit::{AuditEventType, AuditLogger, AuditOutcome, AuthMethod};
 use crate::config::MaskingRule;
 use crate::db_scanner::{DbScanner, ScanConfig, ScanError};
-use crate::state::AppState;
+use crate::state::{AppState, DbProtocol};
 use axum::{
     Json, Router,
     body::Body,
@@ -224,12 +224,19 @@ pub async fn start_api_server(port: u16, state: AppState) -> anyhow::Result<()> 
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     let health_status = state.health_status.read().await;
     let active_connections = state.active_connections.load(Ordering::Relaxed);
+    let protocol = match state.db_protocol {
+        DbProtocol::Postgres => "postgres",
+        DbProtocol::MySql => "mysql",
+    };
 
     let response = json!({
         "status": if health_status.healthy { "ok" } else { "degraded" },
         "service": "ironveil",
         "version": env!("CARGO_PKG_VERSION"),
         "upstream": {
+            "host": state.upstream_host.as_ref(),
+            "port": state.upstream_port,
+            "protocol": protocol,
             "healthy": health_status.healthy,
             "last_check": health_status.last_check,
             "last_error": health_status.last_error,
@@ -748,6 +755,7 @@ mod tests {
     use super::*;
     use crate::config::{ApiConfig, AppConfig};
     use crate::state::DbProtocol;
+    use axum::body::to_bytes;
     use axum::extract::State;
     use tempfile::{NamedTempFile, tempdir};
 
@@ -760,6 +768,29 @@ mod tests {
 
         // For default state (healthy), we should get 200 OK
         assert_eq!(status.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_includes_upstream_runtime_info() {
+        let config = AppConfig::default();
+        let state = AppState::new(
+            config,
+            "proxy.yaml".to_string(),
+            "db.internal".to_string(),
+            6432,
+            DbProtocol::MySql,
+        );
+
+        let response = health_check(State(state)).await.into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::OK);
+
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(payload["upstream"]["host"], "db.internal");
+        assert_eq!(payload["upstream"]["port"], 6432);
+        assert_eq!(payload["upstream"]["protocol"], "mysql");
     }
 
     #[tokio::test]

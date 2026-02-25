@@ -308,10 +308,10 @@ audit:
 | Category | Total | Completed | Remaining |
 |----------|-------|-----------|-----------|
 | 🔴 Critical | 6 | 6 | 0 |
-| 🟡 High Priority | 5 | 4 | 1 |
+| 🟡 High Priority | 5 | 5 | 0 |
 | 🟢 Medium Priority | 5 | 4 | 1 |
 | 🔵 Low Priority | 4 | 1 | 3 |
-| **Total** | **20** | **15** | **5** |
+| **Total** | **20** | **16** | **4** |
 
 ---
 
@@ -320,7 +320,7 @@ audit:
 - [x] Create `.dockerignore` file
 - [x] Fix `unwrap()` calls (5 locations)
 - [x] Add connection timeout config
-- [ ] Fetch version dynamically in settings page
+- [x] Fetch version and upstream metadata dynamically in settings page
 
 ---
 

@@ -207,6 +207,21 @@ The management API runs on port 3001 by default.
 | `/logs` | GET | Get recent query logs |
 | `/audit` | GET | Get audit logs (supports `?limit=N`, `?event_type=X`, `?outcome=Y`) |
 
+`GET /health` includes runtime upstream metadata:
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "upstream": {
+    "host": "localhost",
+    "port": 5432,
+    "protocol": "postgres",
+    "healthy": true
+  }
+}
+```
+
 ### Scan Request Body
 
 `POST /scan` and `POST /schema` require a JSON body:

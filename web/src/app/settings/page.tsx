@@ -11,9 +11,36 @@ import { Label } from "@/components/ui/label"
 import { motion } from "framer-motion"
 import { apiFetch } from "@/lib/api"
 
+type HealthResponse = {
+  version?: string
+  upstream?: {
+    host?: string
+    port?: number
+    protocol?: string
+  }
+}
+
+function formatProtocolLabel(protocol: string | null): string {
+  if (!protocol) {
+    return "Unknown"
+  }
+
+  const normalized = protocol.toLowerCase()
+  if (normalized === "postgres") {
+    return "PostgreSQL"
+  }
+  if (normalized === "mysql") {
+    return "MySQL"
+  }
+  return protocol
+}
+
 export default function SettingsPage() {
   const [config, setConfig] = useState<{ masking_enabled: boolean; rules_count: number } | null>(null)
   const [version, setVersion] = useState<string | null>(null)
+  const [upstreamHost, setUpstreamHost] = useState<string | null>(null)
+  const [upstreamPort, setUpstreamPort] = useState<number | null>(null)
+  const [upstreamProtocol, setUpstreamProtocol] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [apiKey, setApiKey] = useState("")
@@ -35,8 +62,11 @@ export default function SettingsPage() {
   const fetchHealth = async () => {
     try {
       const res = await apiFetch("/health")
-      const data = await res.json()
+      const data = (await res.json()) as HealthResponse
       setVersion(data?.version ?? null)
+      setUpstreamHost(data?.upstream?.host ?? null)
+      setUpstreamPort(typeof data?.upstream?.port === "number" ? data.upstream.port : null)
+      setUpstreamProtocol(data?.upstream?.protocol ?? null)
     } catch (error) {
       console.error("Failed to fetch health", error)
     }
@@ -259,19 +289,16 @@ export default function SettingsPage() {
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="flex justify-between items-center text-sm py-2 border-b border-gray-800">
-                  <span className="text-gray-400">Proxy Port</span>
-                  <code className="px-2 py-1 bg-gray-800 rounded text-gray-200">6543</code>
+                  <span className="text-gray-400">Upstream Host</span>
+                  <code className="px-2 py-1 bg-gray-800 rounded text-gray-200">{upstreamHost ?? "unknown"}</code>
                 </div>
                 <div className="flex justify-between items-center text-sm py-2 border-b border-gray-800">
-                  <span className="text-gray-400">API Port</span>
-                  <code className="px-2 py-1 bg-gray-800 rounded text-gray-200">3001</code>
+                  <span className="text-gray-400">Upstream Port</span>
+                  <code className="px-2 py-1 bg-gray-800 rounded text-gray-200">{upstreamPort ?? "unknown"}</code>
                 </div>
                 <div className="flex justify-between items-center text-sm py-2 border-b border-gray-800">
-                  <span className="text-gray-400">Protocols</span>
-                  <div className="flex gap-2">
-                    <Badge variant="info">PostgreSQL</Badge>
-                    <Badge variant="purple">MySQL</Badge>
-                  </div>
+                  <span className="text-gray-400">Protocol</span>
+                  <Badge variant="info">{formatProtocolLabel(upstreamProtocol)}</Badge>
                 </div>
                 <div className="flex justify-between items-center text-sm py-2 border-b border-gray-800">
                   <span className="text-gray-400">Active Rules</span>
