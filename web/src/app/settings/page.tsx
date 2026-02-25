@@ -16,6 +16,9 @@ export default function SettingsPage() {
   const [version, setVersion] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
+  const [apiKey, setApiKey] = useState("")
+  const [jwtToken, setJwtToken] = useState("")
+  const [authSaved, setAuthSaved] = useState(false)
 
   const fetchConfig = async () => {
     try {
@@ -42,7 +45,31 @@ export default function SettingsPage() {
   useEffect(() => {
     fetchConfig()
     fetchHealth()
+    if (typeof window !== "undefined") {
+      setApiKey(localStorage.getItem("ironveil.api_key") ?? "")
+      setJwtToken(localStorage.getItem("ironveil.jwt") ?? "")
+    }
   }, [])
+
+  const saveApiAuth = () => {
+    const trimmedApiKey = apiKey.trim()
+    const trimmedJwtToken = jwtToken.trim()
+
+    if (trimmedApiKey) {
+      localStorage.setItem("ironveil.api_key", trimmedApiKey)
+    } else {
+      localStorage.removeItem("ironveil.api_key")
+    }
+
+    if (trimmedJwtToken) {
+      localStorage.setItem("ironveil.jwt", trimmedJwtToken)
+    } else {
+      localStorage.removeItem("ironveil.jwt")
+    }
+
+    setAuthSaved(true)
+    setTimeout(() => setAuthSaved(false), 1500)
+  }
 
   const toggleMasking = async () => {
     if (!config) return
@@ -157,6 +184,60 @@ export default function SettingsPage() {
                   </p>
                 </div>
                 <ThemeToggle />
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.15 }}
+        >
+          <Card className="bg-gray-900 border-gray-800">
+            <CardHeader>
+              <CardTitle className="text-white flex items-center gap-2">
+                <Shield className="h-5 w-5 text-emerald-400" />
+                API Authentication
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="api-key" className="block text-sm text-gray-400 mb-1">
+                    API Key
+                  </label>
+                  <input
+                    id="api-key"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder="X-API-Key"
+                    className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="jwt-token" className="block text-sm text-gray-400 mb-1">
+                    JWT Token
+                  </label>
+                  <input
+                    id="jwt-token"
+                    value={jwtToken}
+                    onChange={(e) => setJwtToken(e.target.value)}
+                    placeholder="Bearer token"
+                    className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+                  />
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-gray-500">
+                  Stored in browser local storage and applied to dashboard API requests.
+                </p>
+                <div className="flex items-center gap-2">
+                  {authSaved && <span className="text-xs text-emerald-400">Saved</span>}
+                  <Button variant="outline" onClick={saveApiAuth}>
+                    Save API Auth
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>

@@ -184,6 +184,8 @@ At runtime in the browser, you can also override auth via local storage keys:
 - `ironveil.api_key`
 - `ironveil.jwt`
 
+The Settings page includes an **API Authentication** panel that writes these values for you.
+
 ## Screenshots
 
 ### Dashboard

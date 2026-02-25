@@ -98,4 +98,17 @@ describe("SettingsPage", () => {
     expect(fetchMock).toHaveBeenCalledWith("http://localhost:3001/rules")
     expect(window.URL.createObjectURL).toHaveBeenCalled()
   })
+
+  it("saves API auth settings to localStorage", async () => {
+    const user = userEvent.setup()
+    const setItemSpy = jest.spyOn(Storage.prototype, "setItem")
+    render(<SettingsPage />)
+
+    await user.type(await screen.findByLabelText(/api key/i), "top-secret")
+    await user.type(screen.getByLabelText(/jwt token/i), "jwt-123")
+    await user.click(screen.getByRole("button", { name: /save api auth/i }))
+
+    expect(setItemSpy).toHaveBeenCalledWith("ironveil.api_key", "top-secret")
+    expect(setItemSpy).toHaveBeenCalledWith("ironveil.jwt", "jwt-123")
+  })
 })
