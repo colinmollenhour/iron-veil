@@ -12,7 +12,7 @@
 *   **Real-time Anonymization**: Masks PII data in database result sets on the fly.
 *   **Multi-Database Support**: Works with both **PostgreSQL** and **MySQL** wire protocols.
 *   **Zero-Copy Parsing**: Built with `tokio` and `bytes` for high throughput and low latency.
-*   **Configurable Rules**: Define masking strategies per column via `proxy.yaml` (table-scoped matching is fully supported for MySQL).
+*   **Configurable Rules**: Define masking strategies per column via `proxy.yaml` with table-scoped matching for MySQL and PostgreSQL.
 *   **TLS Support**: Client-to-proxy and proxy-to-upstream TLS encryption.
 
 ### PII Detection
@@ -164,8 +164,8 @@ rules:
 ### Rule Matching Notes
 
 - MySQL: `table` + `column` rules are enforced as configured.
-- PostgreSQL: due to wire-protocol metadata limits in `RowDescription`, only global `column` rules are currently applied at runtime.
-- For PostgreSQL, prefer global column rules until table OID-to-name resolution is implemented.
+- PostgreSQL: IronVeil resolves `table_oid` values to table names at session bootstrap and then enforces `table` + `column` rules.
+- If PostgreSQL OID lookup fails (for example due to permissions), IronVeil safely falls back to global `column` rules for that session.
 
 ### PII Types Auto-Detected
 

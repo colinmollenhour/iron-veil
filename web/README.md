@@ -182,7 +182,8 @@ Rule behavior:
 ## Rule Matching Notes
 
 - MySQL runtime masking supports table-scoped rules (`table` + `column`).
-- PostgreSQL runtime masking currently applies global column rules only.
+- PostgreSQL runtime masking resolves table OIDs at session bootstrap and applies table-scoped rules (`table` + `column`).
+- If PostgreSQL OID resolution fails, runtime behavior falls back to global column rules for safety.
 
 ## Development
 

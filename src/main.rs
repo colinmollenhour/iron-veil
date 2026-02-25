@@ -20,9 +20,9 @@ mod telemetry;
 use crate::config::AppConfig;
 use crate::interceptor::{Anonymizer, MySqlAnonymizer, MySqlPacketInterceptor, PacketInterceptor};
 use crate::protocol::mysql::{MySqlCodec, MySqlMessage};
-use crate::protocol::postgres::{PgMessage, PostgresCodec};
+use crate::protocol::postgres::{DataRow, PgMessage, PostgresCodec, QueryMessage};
 use crate::state::{AppState, DbProtocol as StateDbProtocol, LogEntry};
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use rustls_platform_verifier::Verifier;
@@ -670,6 +670,7 @@ where
 
     let connection_id = rand::random::<u64>() as usize;
     let mut interceptor = Anonymizer::new(state.clone(), connection_id);
+    let mut postgres_oid_bootstrap_done = false;
 
     loop {
         tokio::select! {
@@ -741,18 +742,34 @@ where
             msg = upstream_framed.next() => {
                 match msg {
                     Some(Ok(msg)) => {
-                        let msg_to_send = match msg {
-                            PgMessage::RowDescription(ref rd) => {
-                                interceptor.on_row_description(rd).await;
-                                PgMessage::RowDescription(rd.clone())
+                        match msg {
+                            PgMessage::Regular(regular)
+                                if regular.message_type == b'Z' && !postgres_oid_bootstrap_done =>
+                            {
+                                client_framed.send(PgMessage::Regular(regular)).await?;
+                                postgres_oid_bootstrap_done = true;
+
+                                match bootstrap_postgres_table_oid_map(&mut upstream_framed, &mut interceptor).await {
+                                    Ok(loaded) => {
+                                        info!("Loaded {} PostgreSQL table OID mappings for table-scoped rules", loaded);
+                                    }
+                                    Err(err) => {
+                                        warn!("Failed to bootstrap PostgreSQL table OID mappings: {}", err);
+                                    }
+                                }
+                            }
+                            PgMessage::RowDescription(rd) => {
+                                interceptor.on_row_description(&rd).await;
+                                client_framed.send(PgMessage::RowDescription(rd)).await?;
                             }
                             PgMessage::DataRow(dr) => {
                                 let new_dr = interceptor.on_data_row(dr).await?;
-                                PgMessage::DataRow(new_dr)
+                                client_framed.send(PgMessage::DataRow(new_dr)).await?;
                             }
-                            _ => msg,
-                        };
-                        client_framed.send(msg_to_send).await?;
+                            other => {
+                                client_framed.send(other).await?;
+                            }
+                        }
                     }
                     Some(Err(e)) => return Err(e),
                     None => return Ok(()), // Upstream disconnected
@@ -765,6 +782,65 @@ where
             }
         }
     }
+}
+
+fn decode_postgres_data_row_text_value(row: &DataRow, index: usize) -> Option<String> {
+    row.values
+        .get(index)
+        .and_then(|v| v.as_ref())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(|value| value.trim().to_string())
+}
+
+async fn bootstrap_postgres_table_oid_map<U>(
+    upstream_framed: &mut Framed<U, PostgresCodec>,
+    interceptor: &mut Anonymizer,
+) -> Result<usize>
+where
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Read all regular tables, partitions, views and foreign tables that appear in result sets.
+    const OID_LOOKUP_QUERY: &str = "
+        SELECT c.oid::text, n.nspname, c.relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+    ";
+
+    upstream_framed
+        .send(PgMessage::Query(QueryMessage {
+            query: Bytes::copy_from_slice(OID_LOOKUP_QUERY.as_bytes()),
+        }))
+        .await?;
+
+    let mut loaded = 0usize;
+
+    loop {
+        match upstream_framed.next().await {
+            Some(Ok(PgMessage::DataRow(row))) => {
+                let oid = decode_postgres_data_row_text_value(&row, 0)
+                    .and_then(|raw| raw.parse::<u32>().ok());
+                let schema = decode_postgres_data_row_text_value(&row, 1);
+                let table = decode_postgres_data_row_text_value(&row, 2);
+
+                if let (Some(oid), Some(schema), Some(table)) = (oid, schema, table) {
+                    interceptor.register_postgres_table_oid(oid, &schema, &table);
+                    loaded += 1;
+                }
+            }
+            Some(Ok(PgMessage::Regular(msg))) if msg.message_type == b'Z' => break,
+            Some(Ok(_)) => {}
+            Some(Err(err)) => return Err(err),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Upstream disconnected during OID map bootstrap"
+                ));
+            }
+        }
+    }
+
+    Ok(loaded)
 }
 
 // ============================================================================

@@ -11,6 +11,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 fn generate_fake_data(strategy: &str, seed: u64) -> String {
@@ -44,6 +45,10 @@ fn pii_type_to_strategy(pii_type: PiiType) -> &'static str {
         PiiType::DateOfBirth => "dob",
         PiiType::Passport => "passport",
     }
+}
+
+fn normalize_identifier(input: &str) -> String {
+    input.trim().to_ascii_lowercase()
 }
 
 fn mask_json_recursively(val: &mut serde_json::Value, scanner: &PiiScanner) {
@@ -164,6 +169,7 @@ pub struct Anonymizer {
     state: AppState,
     scanner: PiiScanner,
     target_cols: Vec<(usize, String)>,
+    table_names_by_oid: HashMap<u32, HashSet<String>>,
     connection_id: usize,
 }
 
@@ -173,8 +179,30 @@ impl Anonymizer {
             state,
             scanner: PiiScanner::new(),
             target_cols: Vec::new(),
+            table_names_by_oid: HashMap::new(),
             connection_id,
         }
+    }
+
+    pub fn register_postgres_table_oid(&mut self, oid: u32, schema: &str, table: &str) {
+        if oid == 0 {
+            return;
+        }
+
+        let aliases = self.table_names_by_oid.entry(oid).or_default();
+        aliases.insert(normalize_identifier(table));
+        aliases.insert(normalize_identifier(&format!("{}.{}", schema, table)));
+    }
+
+    fn postgres_rule_matches_table(&self, table_oid: u32, rule_table: &str) -> bool {
+        if table_oid == 0 {
+            return false;
+        }
+
+        let normalized_rule_table = normalize_identifier(rule_table);
+        self.table_names_by_oid
+            .get(&table_oid)
+            .is_some_and(|aliases| aliases.contains(&normalized_rule_table))
     }
 }
 
@@ -186,15 +214,19 @@ impl PacketInterceptor for Anonymizer {
         let config = self.state.config.read().await;
         for (i, field) in msg.fields.iter().enumerate() {
             for rule in &config.rules {
-                // Check if rule applies to this column
-                // PostgreSQL RowDescription includes table OID but not table name.
-                // Until OID->name resolution is implemented, only global (table-less) rules
-                // are safe to apply here.
-                let table_match = rule.table.is_none();
+                // Check if rule applies to this column.
+                let table_match = match rule.table.as_deref() {
+                    None => true,
+                    Some(rule_table) => {
+                        self.postgres_rule_matches_table(field.table_oid, rule_table)
+                    }
+                };
 
                 // Convert Bytes field name to str for comparison
                 let field_name = std::str::from_utf8(&field.name).unwrap_or("");
-                if table_match && rule.column == field_name {
+                if table_match
+                    && normalize_identifier(&rule.column) == normalize_identifier(field_name)
+                {
                     self.target_cols.push((i, rule.strategy.clone()));
                     break; // Apply first matching rule
                 }
@@ -632,6 +664,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_postgres_table_scoped_rule_applies_when_table_oid_is_present() {
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![MaskingRule {
+                table: Some("users".to_string()),
+                column: "email_col".to_string(),
+                strategy: "address".to_string(),
+            }],
+            tls: None,
+            upstream_tls: false,
+            telemetry: None,
+            api: None,
+            limits: None,
+            health_check: None,
+            audit: None,
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = Anonymizer::new(state, 1);
+        anonymizer.register_postgres_table_oid(123, "public", "users");
+
+        let desc = RowDescription {
+            fields: vec![FieldDescription {
+                name: bytes::Bytes::from_static(b"email_col"),
+                table_oid: 123,
+                column_index: 1,
+                type_oid: 0,
+                type_len: 0,
+                type_modifier: 0,
+                format_code: 0,
+            }],
+        };
+
+        anonymizer.on_row_description(&desc).await;
+
+        let original = "test@example.com";
+        let mut row = DataRow {
+            values: vec![Some(BytesMut::from(original.as_bytes()))],
+        };
+
+        row = anonymizer.on_data_row(row).await.unwrap();
+        let masked = std::str::from_utf8(row.values[0].as_ref().unwrap()).unwrap();
+
+        assert_ne!(
+            masked, original,
+            "PostgreSQL table-scoped rules should apply after OID-to-table resolution"
+        );
+        assert!(
+            !masked.contains("@"),
+            "Table-scoped address strategy should override heuristic email masking"
+        );
+    }
+
+    #[tokio::test]
     async fn test_postgres_table_scoped_rule_not_applied_without_table_resolution() {
         let config = AppConfig {
             masking_enabled: true,
@@ -675,7 +760,7 @@ mod tests {
 
         assert_eq!(
             masked, original,
-            "PostgreSQL table-scoped rules must not apply without table-name resolution"
+            "PostgreSQL table-scoped rules must not apply without OID-to-table resolution"
         );
     }
 
