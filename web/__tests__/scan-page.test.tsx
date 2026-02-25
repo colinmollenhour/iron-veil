@@ -114,4 +114,46 @@ describe("ScanPage", () => {
     expect(await screen.findByText("Authentication required")).toBeInTheDocument()
     errorSpy.mockRestore()
   })
+
+  it("marks findings as already applied when matching persisted rules exist", async () => {
+    const user = userEvent.setup()
+    const fetchMock = global.fetch as jest.Mock
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+
+      if (url.endsWith("/rules")) {
+        return createResponse({
+          rules: [
+            {
+              table: "users",
+              column: "email",
+              strategy: "email"
+            }
+          ]
+        }) as Response
+      }
+
+      if (url.endsWith("/scan")) {
+        return createResponse({
+          findings: [
+            {
+              table: "users",
+              column: "email",
+              pii_type: "Email",
+              confidence: 0.92,
+              sample: "tes***com"
+            }
+          ]
+        }) as Response
+      }
+
+      return createResponse({}) as Response
+    })
+
+    render(<ScanPage />)
+    await user.click(screen.getByRole("button", { name: /start new scan/i }))
+
+    const appliedButton = await screen.findByRole("button", { name: /rule applied/i })
+    expect(appliedButton).toBeDisabled()
+  })
 })

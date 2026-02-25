@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { ScanSearch, ShieldCheck, AlertTriangle, Loader2, CheckCircle } from "lucide-react"
 import { ApiError, apiFetchJson } from "@/lib/api"
 
@@ -23,6 +23,21 @@ interface ScanFormState {
   excludeTables: string
 }
 
+interface PersistedRule {
+  table: string | null
+  column: string
+}
+
+interface RulesResponse {
+  rules?: PersistedRule[]
+}
+
+function normalizeRuleKey(table: string | null | undefined, column: string): string {
+  const normalizedTable = (table ?? "").trim().toLowerCase()
+  const normalizedColumn = column.trim().toLowerCase()
+  return `${normalizedTable}.${normalizedColumn}`
+}
+
 export default function ScanPage() {
   const [isScanning, setIsScanning] = useState(false)
   const [findings, setFindings] = useState<Finding[]>([])
@@ -39,6 +54,22 @@ export default function ScanPage() {
     excludeTables: "",
   })
 
+  const fetchAppliedRules = async () => {
+    try {
+      const data = await apiFetchJson<RulesResponse>("/rules")
+      const keys = new Set(
+        (data.rules || []).map((rule) => normalizeRuleKey(rule.table, rule.column))
+      )
+      setAppliedRules(keys)
+    } catch (error) {
+      console.error("Failed to fetch rules:", error)
+    }
+  }
+
+  useEffect(() => {
+    void fetchAppliedRules()
+  }, [])
+
   const startScan = async () => {
     setIsScanning(true)
     setScanComplete(false)
@@ -46,6 +77,7 @@ export default function ScanPage() {
     setScanError(null)
     
     try {
+      await fetchAppliedRules()
       const data = await apiFetchJson<{ findings?: Finding[] }>("/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -80,7 +112,7 @@ export default function ScanPage() {
   }
 
   const applyRule = async (finding: Finding) => {
-    const ruleId = `${finding.table}.${finding.column}`
+    const ruleId = normalizeRuleKey(finding.table, finding.column)
     const detectedType = finding.type || finding.pii_type || ""
     
     try {
@@ -240,7 +272,7 @@ export default function ScanPage() {
         {findings.length > 0 && (
           <div className="grid gap-4">
             {findings.map((finding, idx) => {
-              const ruleId = `${finding.table}.${finding.column}`
+              const ruleId = normalizeRuleKey(finding.table, finding.column)
               const isApplied = appliedRules.has(ruleId)
               const detectedType = finding.type || finding.pii_type || "Unknown"
 
