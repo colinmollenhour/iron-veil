@@ -303,6 +303,72 @@ audit:
 
 ---
 
+## 🧭 Strategic Backlog (From FEATURE_IDEAS.md)
+
+These are high-value future enhancements. They are not yet included in the progress totals below.
+
+### 21. Tokenization Vault Mode
+- [ ] Add reversible, deterministic tokenization backed by KMS/HSM-managed keys
+- [ ] Support tenant/table/column token scopes while preserving join/index workflows
+- [ ] Add token issuance/revocation audit events and key rotation metrics
+
+### 22. Pluggable Policy Engine
+- [ ] Integrate OPA/Rego or CEL for role-aware and tenant-aware masking decisions
+- [ ] Add policy-driven query allow/deny evaluation and policy hot-reload via config
+- [ ] Log policy decisions with trace IDs for auditability
+
+### 23. Shadow Masking and Staged Rollout
+- [ ] Execute candidate rules in shadow mode alongside active rules
+- [ ] Compare masked vs passthrough outputs and surface deltas in API/UI
+- [ ] Add promotion and rollback safety switches
+
+### 24. Replay and Simulation Harness
+- [ ] Build offline replay pipeline for sanitized query logs
+- [ ] Report masking coverage, protocol correctness, and latency impact pre-release
+- [ ] Add repeatable benchmark profiles for regression testing
+
+### 25. Advanced Performance Guardrails
+- [ ] Add per-tenant and per-query-class budgets (RPS/throughput/latency)
+- [ ] Add circuit breakers, backpressure controls, and queue depth telemetry
+- [ ] Extend metrics for masked bytes, masking latency, and cache hit/miss
+
+### 26. Secrets and TLS Rotation Integration
+- [ ] Integrate external secret stores (Vault/AWS Secrets Manager) for DB and TLS material
+- [ ] Add automated secret/certificate rotation with grace periods
+- [ ] Expose secret age/rotation health indicators in `/health` and metrics
+
+### 27. Just-in-Time Privileged Access
+- [ ] Add time-bound exception tokens with reason codes
+- [ ] Enforce automatic expiry and full audit trail in proxy and management API
+- [ ] Support optional multi-approver exception workflow
+
+### 28. Schema Drift Watcher
+- [ ] Detect upstream schema drift continuously
+- [ ] Generate masking rule diff proposals
+- [ ] Add approval workflow with optional auto-apply and audit events
+
+### 29. Data Lineage and Compliance Exports
+- [ ] Tag traces/metrics with PII categories and masking decisions
+- [ ] Export compliance evidence in CSV/JSON formats
+- [ ] Provide SIEM-friendly export formats and schedules
+
+### 30. Connection Pooling and Multi-Upstream Routing
+- [ ] Implement upstream connection pooling with configurable size and eviction
+- [ ] Add routing by database/user/tenant with per-upstream limits and health awareness
+- [ ] Align implementation with existing items #15 (Connection Pooling) and #17 (Multi-Database Support)
+
+### 31. Query Guardrails
+- [ ] Add allow/deny lists and rewrite hooks for dangerous query patterns
+- [ ] Add policy-driven exceptions and audit trails for overridden blocks
+- [ ] Align implementation with existing item #18 (Query Rewriting)
+
+### 32. Inline Benchmarking Endpoint
+- [ ] Add built-in load test endpoint for masking strategy latency/throughput
+- [ ] Benchmark rule sets and suggest faster alternatives when thresholds are exceeded
+- [ ] Export benchmark results for CI and release gating
+
+---
+
 ## Progress Tracking
 
 | Category | Total | Completed | Remaining |
