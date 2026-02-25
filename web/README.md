@@ -127,7 +127,7 @@ The dashboard connects to the IronVeil Management API:
 |----------|--------|-------------|
 | `/health` | GET | Service health check with upstream status |
 | `/rules` | GET | List masking rules (`{ "rules": [...] }`) |
-| `/rules` | POST | Add a new masking rule |
+| `/rules` | POST | Add or update a masking rule (upsert by `table`+`column`) |
 | `/rules/delete` | POST | Delete a rule by index or column/table |
 | `/config` | GET | Get config summary (`masking_enabled`, `rules_count`) |
 | `/config` | POST | Update configuration |
@@ -172,6 +172,12 @@ The dashboard connects to the IronVeil Management API:
 - `501 Not Implemented` (`unsupported_protocol`) when IronVeil runs with `--protocol mysql`.
 - `502 Bad Gateway` (`connection_failed`) when upstream DB connection fails.
 - `500 Internal Server Error` (`query_failed`) when schema/query execution fails after connection.
+
+Rule behavior:
+
+- Rule targets are unique by `(table, column)` (case-insensitive).
+- Adding a rule for an existing target updates its strategy instead of creating duplicates.
+- Import also deduplicates duplicate targets.
 
 ## Rule Matching Notes
 

@@ -193,7 +193,7 @@ The management API runs on port 3001 by default.
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/rules` | GET | List masking rules (returns `{ "rules": [...] }`) |
-| `/rules` | POST | Add a new masking rule |
+| `/rules` | POST | Add or update a masking rule (upsert by `table`+`column`) |
 | `/rules/delete` | POST | Delete a rule by index or column/table |
 | `/rules/export` | GET | Export rules as JSON |
 | `/rules/import` | POST | Import rules from JSON array |
@@ -244,6 +244,14 @@ The management API runs on port 3001 by default.
 - `501 Not Implemented` with code `unsupported_protocol` when IronVeil runs with `--protocol mysql`.
 - `502 Bad Gateway` with code `connection_failed` when upstream DB connection fails.
 - `500 Internal Server Error` with code `query_failed` when schema/query execution fails after connection.
+
+### Rule Upsert & Deduplication
+
+- Rule identity is normalized by `(table, column)` (case-insensitive).
+- `POST /rules` is idempotent for the same target:
+  - same strategy -> unchanged
+  - different strategy -> updates existing rule strategy
+- `POST /rules/import` deduplicates incoming and existing duplicates by target.
 
 ### Authentication
 

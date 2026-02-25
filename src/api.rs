@@ -14,6 +14,7 @@ use axum::{
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use tower_http::cors::CorsLayer;
@@ -263,13 +264,62 @@ async fn get_rules(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleMutationOutcome {
+    Added,
+    Updated,
+    Unchanged,
+}
+
+impl RuleMutationOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            RuleMutationOutcome::Added => "added",
+            RuleMutationOutcome::Updated => "updated",
+            RuleMutationOutcome::Unchanged => "unchanged",
+        }
+    }
+}
+
+fn normalized_rule_key(rule: &MaskingRule) -> (Option<String>, String) {
+    let table = rule.table.as_ref().map(|t| t.trim().to_ascii_lowercase());
+    let column = rule.column.trim().to_ascii_lowercase();
+    (table, column)
+}
+
+fn dedupe_rules(rules: &mut Vec<MaskingRule>) -> usize {
+    let original_len = rules.len();
+    let mut seen = HashSet::new();
+    rules.retain(|rule| seen.insert(normalized_rule_key(rule)));
+    original_len - rules.len()
+}
+
+fn upsert_rule(rules: &mut Vec<MaskingRule>, incoming: MaskingRule) -> RuleMutationOutcome {
+    let incoming_key = normalized_rule_key(&incoming);
+    if let Some(existing) = rules
+        .iter_mut()
+        .find(|rule| normalized_rule_key(rule) == incoming_key)
+    {
+        if existing.strategy == incoming.strategy {
+            RuleMutationOutcome::Unchanged
+        } else {
+            existing.strategy = incoming.strategy;
+            RuleMutationOutcome::Updated
+        }
+    } else {
+        rules.push(incoming);
+        RuleMutationOutcome::Added
+    }
+}
+
 async fn add_rule(
     State(state): State<AppState>,
     Json(rule): Json<MaskingRule>,
 ) -> impl IntoResponse {
     let mut config = state.config.write().await;
     let rule_json = serde_json::to_value(&rule).unwrap_or_default();
-    config.rules.push(rule);
+    let deduplicated_existing = dedupe_rules(&mut config.rules);
+    let result = upsert_rule(&mut config.rules, rule);
     let rules_count = config.rules.len();
     drop(config);
 
@@ -289,12 +339,21 @@ async fn add_rule(
     // Log audit event
     state
         .audit_logger
-        .log(AuditLogger::rule_added(rule_json))
+        .log(AuditLogger::rule_added(json!({
+            "rule": rule_json,
+            "result": result.as_str(),
+            "deduplicated_existing": deduplicated_existing
+        })))
         .await;
 
     (
         StatusCode::OK,
-        Json(json!({ "status": "success", "rules_count": rules_count })),
+        Json(json!({
+            "status": "success",
+            "result": result.as_str(),
+            "rules_count": rules_count,
+            "deduplicated_existing": deduplicated_existing
+        })),
     )
 }
 
@@ -411,7 +470,17 @@ async fn import_rules(
 ) -> impl IntoResponse {
     let mut config = state.config.write().await;
     let imported_count = rules.len();
-    config.rules.extend(rules);
+    let deduplicated_existing = dedupe_rules(&mut config.rules);
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let mut unchanged = 0usize;
+    for rule in rules {
+        match upsert_rule(&mut config.rules, rule) {
+            RuleMutationOutcome::Added => added += 1,
+            RuleMutationOutcome::Updated => updated += 1,
+            RuleMutationOutcome::Unchanged => unchanged += 1,
+        }
+    }
     let total_count = config.rules.len();
     drop(config);
 
@@ -438,7 +507,11 @@ async fn import_rules(
         Json(json!({
             "status": "success",
             "imported": imported_count,
-            "rules_count": total_count
+            "rules_count": total_count,
+            "added": added,
+            "updated": updated,
+            "unchanged": unchanged,
+            "deduplicated_existing": deduplicated_existing
         })),
     )
 }
@@ -1011,6 +1084,122 @@ mod tests {
         let config = state.config.read().await;
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].column, "phone");
+    }
+
+    #[tokio::test]
+    async fn test_add_rule_upserts_existing_rule_for_same_table_and_column() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path().to_string_lossy().to_string();
+        std::fs::write(&config_path, "masking_enabled: true\nrules: []\n").unwrap();
+
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![MaskingRule {
+                table: Some("users".to_string()),
+                column: "email".to_string(),
+                strategy: "email".to_string(),
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, config_path);
+
+        let updated_rule = MaskingRule {
+            table: Some("Users".to_string()),
+            column: "EMAIL".to_string(),
+            strategy: "hash".to_string(),
+        };
+
+        let response = add_rule(State(state.clone()), Json(updated_rule))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let config = state.config.read().await;
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].strategy, "hash");
+    }
+
+    #[tokio::test]
+    async fn test_import_rules_deduplicates_existing_and_imported_rules() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path().to_string_lossy().to_string();
+        std::fs::write(&config_path, "masking_enabled: true\nrules: []\n").unwrap();
+
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![
+                MaskingRule {
+                    table: Some("users".to_string()),
+                    column: "email".to_string(),
+                    strategy: "email".to_string(),
+                },
+                MaskingRule {
+                    table: Some("users".to_string()),
+                    column: "email".to_string(),
+                    strategy: "phone".to_string(),
+                },
+                MaskingRule {
+                    table: Some("users".to_string()),
+                    column: "phone".to_string(),
+                    strategy: "phone".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, config_path);
+
+        let imported = vec![
+            MaskingRule {
+                table: Some("users".to_string()),
+                column: "email".to_string(),
+                strategy: "hash".to_string(),
+            },
+            MaskingRule {
+                table: Some("users".to_string()),
+                column: "email".to_string(),
+                strategy: "hash".to_string(),
+            },
+            MaskingRule {
+                table: Some("users".to_string()),
+                column: "PHONE".to_string(),
+                strategy: "phone".to_string(),
+            },
+            MaskingRule {
+                table: None,
+                column: "address".to_string(),
+                strategy: "address".to_string(),
+            },
+        ];
+
+        let response = import_rules(State(state.clone()), Json(imported))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let config = state.config.read().await;
+        assert_eq!(config.rules.len(), 3);
+        assert!(
+            config
+                .rules
+                .iter()
+                .any(|r| r.table.as_deref() == Some("users")
+                    && r.column == "email"
+                    && r.strategy == "hash")
+        );
+        assert!(
+            config
+                .rules
+                .iter()
+                .any(|r| r.table.as_deref() == Some("users")
+                    && r.column == "phone"
+                    && r.strategy == "phone")
+        );
+        assert!(
+            config
+                .rules
+                .iter()
+                .any(|r| r.table.is_none() && r.column == "address" && r.strategy == "address")
+        );
     }
 
     #[tokio::test]
