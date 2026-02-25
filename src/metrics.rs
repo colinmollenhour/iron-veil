@@ -8,14 +8,20 @@
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use std::sync::OnceLock;
+
+static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 /// Initialize the Prometheus metrics recorder.
 /// Returns a handle that can be used to render metrics.
 pub fn init_metrics() -> PrometheusHandle {
-    let builder = PrometheusBuilder::new();
-    builder
-        .install_recorder()
-        .expect("Failed to install Prometheus recorder")
+    METRICS_HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("Failed to install Prometheus recorder")
+        })
+        .clone()
 }
 
 /// Record a new connection
@@ -84,10 +90,14 @@ pub fn record_idle_timeout() {
 
 #[cfg(test)]
 mod tests {
+    use super::init_metrics;
+
     #[test]
-    fn test_metrics_can_be_initialized() {
-        // Just test that metrics can be called without panicking
-        // (actual initialization requires a recorder)
-        // These will be no-ops without a recorder installed
+    fn test_metrics_init_is_idempotent() {
+        let first = init_metrics();
+        let second = init_metrics();
+
+        // Both handles should point to the same underlying registry.
+        assert_eq!(first.render(), second.render());
     }
 }
