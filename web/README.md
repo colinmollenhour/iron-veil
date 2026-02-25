@@ -126,16 +126,30 @@ The dashboard connects to the IronVeil Management API:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Service health check with upstream status |
-| `/rules` | GET | List all masking rules |
+| `/rules` | GET | List masking rules (`{ "rules": [...] }`) |
 | `/rules` | POST | Add a new masking rule |
 | `/rules/delete` | POST | Delete a rule by index or column |
-| `/config` | GET | Get current configuration |
+| `/config` | GET | Get config summary (`masking_enabled`, `rules_count`) |
 | `/config` | POST | Update configuration |
 | `/connections` | GET | Get active connection count |
 | `/logs` | GET | Get recent query logs |
-| `/scan` | POST | Trigger PII scan |
-| `/schema` | POST | Get database schema |
+| `/scan` | POST | Trigger PII scan (requires DB credential payload) |
+| `/schema` | POST | Get database schema (requires DB credential payload) |
 | `/audit` | GET | Get audit logs |
+
+### Scan/Schema Payload
+
+```json
+{
+  "username": "postgres",
+  "password": "password",
+  "database": "postgres",
+  "schema": "public",
+  "sample_size": 100,
+  "confidence_threshold": 0.5,
+  "exclude_tables": []
+}
+```
 
 ## Development
 

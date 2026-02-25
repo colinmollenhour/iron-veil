@@ -251,7 +251,9 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn get_rules(State(state): State<AppState>) -> Json<Value> {
     let config = state.config.read().await;
-    Json(json!(*config))
+    Json(json!({
+        "rules": config.rules
+    }))
 }
 
 async fn add_rule(
@@ -322,13 +324,14 @@ async fn delete_rule(
         config.rules.remove(index);
     } else if let Some(ref column) = req.column {
         config.rules.retain(|rule| {
-            let column_matches = &rule.column != column;
-            let table_matches = req
-                .table
-                .as_ref()
-                .map(|t| rule.table.as_ref() != Some(t))
-                .unwrap_or(true);
-            column_matches || !table_matches
+            if &rule.column != column {
+                return true;
+            }
+            if let Some(ref table) = req.table {
+                rule.table.as_ref() != Some(table)
+            } else {
+                false
+            }
         });
     } else {
         return (
@@ -464,6 +467,14 @@ async fn update_config(State(state): State<AppState>, Json(payload): Json<Value>
             .audit_logger
             .log(AuditLogger::config_change(Value::Object(changes)))
             .await;
+
+        if let Err(e) = state.save_config().await {
+            tracing::error!("Failed to persist config: {}", e);
+            return Json(json!({
+                "status": "error",
+                "error": format!("Failed to persist config: {}", e)
+            }));
+        }
     }
 
     let config = state.config.read().await;
@@ -703,6 +714,7 @@ mod tests {
     use super::*;
     use crate::config::{ApiConfig, AppConfig};
     use axum::extract::State;
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn test_health_check() {
@@ -865,6 +877,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_config() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path().to_string_lossy().to_string();
+        std::fs::write(
+            &config_path,
+            "masking_enabled: true\nupstream_tls: false\nrules: []\n",
+        )
+        .unwrap();
+
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
@@ -876,7 +896,7 @@ mod tests {
             health_check: None,
             audit: None,
         };
-        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let state = AppState::new_for_test(config, config_path);
 
         let payload = json!({ "masking_enabled": false });
         let response = update_config(State(state.clone()), Json(payload)).await;
@@ -892,6 +912,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_rule() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path().to_string_lossy().to_string();
+        std::fs::write(
+            &config_path,
+            "masking_enabled: true\nupstream_tls: false\nrules: []\n",
+        )
+        .unwrap();
+
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
@@ -903,10 +931,7 @@ mod tests {
             health_check: None,
             audit: None,
         };
-        let state = AppState::new_for_test(config, "/tmp/test_proxy.yaml".to_string());
-
-        // Create temp file so save works
-        std::fs::write("/tmp/test_proxy.yaml", "rules: []").ok();
+        let state = AppState::new_for_test(config, config_path);
 
         let new_rule = MaskingRule {
             table: Some("users".to_string()),
@@ -947,6 +972,87 @@ mod tests {
 
         assert!(json["rules"].is_array());
         assert_eq!(json["rules"].as_array().unwrap().len(), 1);
+        assert!(
+            json.get("masking_enabled").is_none(),
+            "GET /rules should return rules only, not full config"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_rule_by_column_and_table_only_deletes_matching_rule() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path().to_string_lossy().to_string();
+        std::fs::write(&config_path, "masking_enabled: true\nrules: []\n").unwrap();
+
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![
+                MaskingRule {
+                    table: Some("users".to_string()),
+                    column: "email".to_string(),
+                    strategy: "email".to_string(),
+                },
+                MaskingRule {
+                    table: Some("accounts".to_string()),
+                    column: "email".to_string(),
+                    strategy: "email".to_string(),
+                },
+                MaskingRule {
+                    table: Some("users".to_string()),
+                    column: "phone".to_string(),
+                    strategy: "phone".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let state = AppState::new_for_test(config, config_path);
+        let request = DeleteRuleRequest {
+            index: None,
+            column: Some("email".to_string()),
+            table: Some("users".to_string()),
+        };
+
+        let _ = delete_rule(State(state.clone()), Json(request)).await;
+
+        let config = state.config.read().await;
+        assert_eq!(config.rules.len(), 2);
+        assert!(
+            !config
+                .rules
+                .iter()
+                .any(|r| r.table.as_deref() == Some("users") && r.column == "email")
+        );
+        assert!(
+            config
+                .rules
+                .iter()
+                .any(|r| r.table.as_deref() == Some("accounts") && r.column == "email")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_config_persists_to_disk() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config_path = temp_file.path().to_string_lossy().to_string();
+        std::fs::write(
+            &config_path,
+            "masking_enabled: true\nupstream_tls: false\nrules: []\n",
+        )
+        .unwrap();
+
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, config_path.clone());
+
+        let payload = json!({ "masking_enabled": false });
+        let _ = update_config(State(state), Json(payload)).await;
+
+        let persisted = AppConfig::load(&config_path).unwrap();
+        assert!(!persisted.masking_enabled);
     }
 
     #[tokio::test]

@@ -6,9 +6,10 @@ import { ScanSearch, ShieldCheck, AlertTriangle, Loader2, CheckCircle } from "lu
 interface Finding {
   table: string
   column: string
-  type: string
+  type?: string
+  pii_type?: string
   confidence: number
-  sample: string
+  sample?: string
 }
 
 export default function ScanPage() {
@@ -23,9 +24,25 @@ export default function ScanPage() {
     setFindings([])
     
     try {
-      const res = await fetch("http://localhost:3001/scan", { method: "POST" })
+      const res = await fetch("http://localhost:3001/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: "postgres",
+          password: "password",
+          database: "postgres",
+          schema: "public",
+          sample_size: 100,
+          confidence_threshold: 0.5,
+          exclude_tables: []
+        })
+      })
       const data = await res.json()
-      setFindings(data.findings)
+      const normalizedFindings: Finding[] = (data.findings || []).map((finding: Finding) => ({
+        ...finding,
+        type: finding.type || finding.pii_type || "Unknown"
+      }))
+      setFindings(normalizedFindings)
       setScanComplete(true)
     } catch (error) {
       console.error("Scan failed:", error)
@@ -36,6 +53,7 @@ export default function ScanPage() {
 
   const applyRule = async (finding: Finding) => {
     const ruleId = `${finding.table}.${finding.column}`
+    const detectedType = finding.type || finding.pii_type || ""
     
     try {
       await fetch("http://localhost:3001/rules", {
@@ -44,9 +62,9 @@ export default function ScanPage() {
         body: JSON.stringify({
           table: finding.table,
           column: finding.column,
-          strategy: finding.type === "Email" ? "email" : 
-                   finding.type === "Phone" ? "phone" : 
-                   finding.type === "CreditCard" ? "credit_card" : "hash"
+          strategy: detectedType === "Email" ? "email" : 
+                   detectedType === "Phone" ? "phone" : 
+                   detectedType === "CreditCard" ? "credit_card" : "hash"
         })
       })
       
@@ -95,6 +113,7 @@ export default function ScanPage() {
             {findings.map((finding, idx) => {
               const ruleId = `${finding.table}.${finding.column}`
               const isApplied = appliedRules.has(ruleId)
+              const detectedType = finding.type || finding.pii_type || "Unknown"
 
               return (
                 <div 
@@ -111,7 +130,7 @@ export default function ScanPage() {
                           {finding.table}.{finding.column}
                         </h3>
                         <span className="px-2 py-1 text-xs font-medium bg-red-500/20 text-red-400 rounded-full border border-red-500/20">
-                          {finding.type}
+                          {detectedType}
                         </span>
                         <span className="px-2 py-1 text-xs font-medium bg-gray-800 text-gray-400 rounded-full">
                           {(finding.confidence * 100).toFixed(0)}% Confidence

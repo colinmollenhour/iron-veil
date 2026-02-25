@@ -185,20 +185,36 @@ The management API runs on port 3001 by default.
 ### Protected Endpoints (Require API Key or JWT)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/rules` | GET | List all masking rules |
+| `/rules` | GET | List masking rules (returns `{ "rules": [...] }`) |
 | `/rules` | POST | Add a new masking rule |
 | `/rules/delete` | POST | Delete a rule by index or column/table |
 | `/rules/export` | GET | Export rules as JSON |
 | `/rules/import` | POST | Import rules from JSON array |
-| `/config` | GET | Get current configuration |
+| `/config` | GET | Get config summary (`masking_enabled`, `rules_count`) |
 | `/config` | POST | Update configuration |
 | `/config/reload` | POST | Reload config from disk |
-| `/scan` | POST | Scan database for PII (queries information_schema, samples data) |
+| `/scan` | POST | Scan database for PII (requires DB credentials in request body) |
 | `/connections` | GET | List active connections |
 | `/stats` | GET | Get statistics (queries, masking counts, connection history) |
 | `/schema` | POST | Get database schema (tables and columns) |
 | `/logs` | GET | Get recent query logs |
 | `/audit` | GET | Get audit logs (supports `?limit=N`, `?event_type=X`, `?outcome=Y`) |
+
+### Scan Request Body
+
+`POST /scan` and `POST /schema` require a JSON body:
+
+```json
+{
+  "username": "postgres",
+  "password": "password",
+  "database": "postgres",
+  "schema": "public",
+  "sample_size": 100,
+  "confidence_threshold": 0.5,
+  "exclude_tables": []
+}
+```
 
 ### Authentication
 
