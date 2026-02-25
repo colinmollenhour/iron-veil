@@ -158,6 +158,7 @@ rules:
 | `phone` | Generates fake phone number | `555-123-4567` |
 | `address` | Generates fake city name | `Springfield` |
 | `credit_card` | Generates fake CC number | `4532-xxxx-xxxx-1234` |
+| `hash` | Deterministic SHA-256 hash | `sha256:2cf24dba5fb0a30e...` |
 | `json` | Recursively masks PII in JSON | `{"email": "fake@example.com"}` |
 
 ### Rule Matching Notes
@@ -199,10 +200,10 @@ The management API runs on port 3001 by default.
 | `/config` | GET | Get config summary (`masking_enabled`, `rules_count`) |
 | `/config` | POST | Update configuration |
 | `/config/reload` | POST | Reload config from disk |
-| `/scan` | POST | Scan database for PII (requires DB credentials in request body) |
+| `/scan` | POST | Scan database for PII (requires DB credentials; PostgreSQL scanner currently) |
 | `/connections` | GET | List active connections |
 | `/stats` | GET | Get statistics (queries, masking counts, connection history) |
-| `/schema` | POST | Get database schema (tables and columns) |
+| `/schema` | POST | Get database schema (PostgreSQL scanner currently) |
 | `/logs` | GET | Get recent query logs |
 | `/audit` | GET | Get audit logs (supports `?limit=N`, `?event_type=X`, `?outcome=Y`) |
 
@@ -221,6 +222,8 @@ The management API runs on port 3001 by default.
   "exclude_tables": []
 }
 ```
+
+If IronVeil is running with `--protocol mysql`, `/scan` and `/schema` currently return `501 Not Implemented` with code `unsupported_protocol`.
 
 ### Authentication
 

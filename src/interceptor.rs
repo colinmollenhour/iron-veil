@@ -9,6 +9,7 @@ use fake::faker::internet::en::SafeEmail;
 use fake::faker::phone_number::en::PhoneNumber;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -25,6 +26,11 @@ fn generate_fake_data(strategy: &str, seed: u64) -> String {
         "passport" => "XXXXXXXX".to_string(),
         _ => "MASKED".to_string(),
     }
+}
+
+fn hash_value(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    format!("sha256:{:x}", digest)
 }
 
 /// Convert PiiType to masking strategy string
@@ -310,12 +316,15 @@ impl PacketInterceptor for Anonymizer {
                 };
 
                 if let Some(strat) = strategy {
-                    // Apply masking
-                    let mut hasher = DefaultHasher::new();
-                    val.hash(&mut hasher);
-                    let seed = hasher.finish();
-
-                    let fake_val = generate_fake_data(strat, seed);
+                    let fake_val = if strat == "hash" {
+                        hash_value(&val[..])
+                    } else {
+                        // Apply deterministic fake-data masking
+                        let mut hasher = DefaultHasher::new();
+                        val.hash(&mut hasher);
+                        let seed = hasher.finish();
+                        generate_fake_data(strat, seed)
+                    };
 
                     val.clear();
                     val.extend_from_slice(fake_val.as_bytes());
@@ -482,14 +491,14 @@ impl MySqlPacketInterceptor for MySqlAnonymizer {
                 };
 
                 if let Some(strat) = strategy {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-
-                    let mut hasher = DefaultHasher::new();
-                    val.hash(&mut hasher);
-                    let seed = hasher.finish();
-
-                    let fake_val = generate_fake_data(strat, seed);
+                    let fake_val = if strat == "hash" {
+                        hash_value(&val[..])
+                    } else {
+                        let mut hasher = DefaultHasher::new();
+                        val.hash(&mut hasher);
+                        let seed = hasher.finish();
+                        generate_fake_data(strat, seed)
+                    };
 
                     val.clear();
                     val.extend_from_slice(fake_val.as_bytes());
@@ -667,6 +676,54 @@ mod tests {
         assert_eq!(
             masked, original,
             "PostgreSQL table-scoped rules must not apply without table-name resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_hash_strategy_returns_sha256_value() {
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![MaskingRule {
+                table: None,
+                column: "secret_col".to_string(),
+                strategy: "hash".to_string(),
+            }],
+            tls: None,
+            upstream_tls: false,
+            telemetry: None,
+            api: None,
+            limits: None,
+            health_check: None,
+            audit: None,
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = Anonymizer::new(state, 1);
+
+        let desc = RowDescription {
+            fields: vec![FieldDescription {
+                name: bytes::Bytes::from_static(b"secret_col"),
+                table_oid: 0,
+                column_index: 0,
+                type_oid: 0,
+                type_len: 0,
+                type_modifier: 0,
+                format_code: 0,
+            }],
+        };
+        anonymizer.on_row_description(&desc).await;
+
+        let original = "sensitive-value";
+        let mut row = DataRow {
+            values: vec![Some(BytesMut::from(original.as_bytes()))],
+        };
+
+        row = anonymizer.on_data_row(row).await.unwrap();
+        let masked = std::str::from_utf8(row.values[0].as_ref().unwrap()).unwrap();
+
+        assert_ne!(masked, original);
+        assert!(
+            masked.starts_with("sha256:"),
+            "hash strategy should output sha256-prefixed value"
         );
     }
 

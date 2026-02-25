@@ -128,13 +128,13 @@ The dashboard connects to the IronVeil Management API:
 | `/health` | GET | Service health check with upstream status |
 | `/rules` | GET | List masking rules (`{ "rules": [...] }`) |
 | `/rules` | POST | Add a new masking rule |
-| `/rules/delete` | POST | Delete a rule by index or column |
+| `/rules/delete` | POST | Delete a rule by index or column/table |
 | `/config` | GET | Get config summary (`masking_enabled`, `rules_count`) |
 | `/config` | POST | Update configuration |
 | `/connections` | GET | Get active connection count |
 | `/logs` | GET | Get recent query logs |
-| `/scan` | POST | Trigger PII scan (requires DB credential payload) |
-| `/schema` | POST | Get database schema (requires DB credential payload) |
+| `/scan` | POST | Trigger PII scan (requires DB credential payload; PostgreSQL scanner currently) |
+| `/schema` | POST | Get database schema (requires DB credential payload; PostgreSQL scanner currently) |
 | `/audit` | GET | Get audit logs |
 
 ### Scan/Schema Payload
@@ -150,6 +150,8 @@ The dashboard connects to the IronVeil Management API:
   "exclude_tables": []
 }
 ```
+
+When IronVeil runs with `--protocol mysql`, `/scan` and `/schema` currently return `501 Not Implemented` (`unsupported_protocol`).
 
 ## Rule Matching Notes
 

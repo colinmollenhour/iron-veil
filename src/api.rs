@@ -1,6 +1,6 @@
 use crate::audit::{AuditEventType, AuditLogger, AuditOutcome, AuthMethod};
 use crate::config::MaskingRule;
-use crate::db_scanner::{DbScanner, ScanConfig};
+use crate::db_scanner::{DbScanner, ScanConfig, ScanError};
 use crate::state::AppState;
 use axum::{
     Json, Router,
@@ -444,7 +444,10 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn update_config(State(state): State<AppState>, Json(payload): Json<Value>) -> Json<Value> {
+async fn update_config(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
     let mut config = state.config.write().await;
     let mut changes = serde_json::Map::new();
 
@@ -470,15 +473,21 @@ async fn update_config(State(state): State<AppState>, Json(payload): Json<Value>
 
         if let Err(e) = state.save_config().await {
             tracing::error!("Failed to persist config: {}", e);
-            return Json(json!({
-                "status": "error",
-                "error": format!("Failed to persist config: {}", e)
-            }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "error": format!("Failed to persist config: {}", e)
+                })),
+            );
         }
     }
 
     let config = state.config.read().await;
-    Json(json!({ "status": "success", "masking_enabled": config.masking_enabled }))
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "success", "masking_enabled": config.masking_enabled })),
+    )
 }
 
 /// Reload configuration from disk
@@ -531,13 +540,7 @@ async fn scan_database(
                 .await;
             (StatusCode::OK, Json(json!(result)))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "status": "error",
-                "error": e.to_string()
-            })),
-        ),
+        Err(e) => scan_error_response(e),
     }
 }
 
@@ -610,11 +613,42 @@ async fn get_schema(
                 .await;
             (StatusCode::OK, Json(json!(schema)))
         }
-        Err(e) => (
+        Err(e) => scan_error_response(e),
+    }
+}
+
+fn scan_error_response(error: ScanError) -> (StatusCode, Json<Value>) {
+    match error {
+        ScanError::UnsupportedProtocol(protocol) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "status": "error",
+                "error": format!("Unsupported database protocol: {:?}", protocol),
+                "code": "unsupported_protocol"
+            })),
+        ),
+        ScanError::AuthRequired => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "status": "error",
+                "error": "Authentication required: please provide database credentials",
+                "code": "auth_required"
+            })),
+        ),
+        ScanError::ConnectionFailed(message) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "error",
+                "error": message,
+                "code": "connection_failed"
+            })),
+        ),
+        ScanError::QueryFailed(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
                 "status": "error",
-                "error": e.to_string()
+                "error": message,
+                "code": "query_failed"
             })),
         ),
     }
@@ -713,8 +747,9 @@ async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use crate::config::{ApiConfig, AppConfig};
+    use crate::state::DbProtocol;
     use axum::extract::State;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, tempdir};
 
     #[tokio::test]
     async fn test_health_check() {
@@ -899,11 +934,10 @@ mod tests {
         let state = AppState::new_for_test(config, config_path);
 
         let payload = json!({ "masking_enabled": false });
-        let response = update_config(State(state.clone()), Json(payload)).await;
-        let json = response.0;
-
-        assert_eq!(json["status"], "success");
-        assert_eq!(json["masking_enabled"], false);
+        let response = update_config(State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
 
         // Verify state was actually updated
         let config = state.config.read().await;
@@ -1056,6 +1090,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_config_returns_500_when_persist_fails() {
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![],
+            ..Default::default()
+        };
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().to_string_lossy().to_string();
+        let state = AppState::new_for_test(config, config_path);
+
+        let payload = json!({ "masking_enabled": false });
+        let response = update_config(State(state), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn test_get_connections() {
         let config = AppConfig {
             masking_enabled: true,
@@ -1079,6 +1131,57 @@ mod tests {
         assert_eq!(json["active_connections"], 3);
     }
 
-    // Note: scan_database and get_schema tests require a real database connection
-    // They are tested via E2E tests instead
+    #[tokio::test]
+    async fn test_scan_database_returns_not_implemented_for_unsupported_protocol() {
+        let config = AppConfig::default();
+        let state = AppState::new(
+            config,
+            "proxy.yaml".to_string(),
+            "localhost".to_string(),
+            3306,
+            DbProtocol::MySql,
+        );
+
+        let request = ScanConfig {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            database: "db".to_string(),
+            sample_size: 10,
+            schema: "public".to_string(),
+            exclude_tables: vec![],
+            confidence_threshold: 0.5,
+        };
+
+        let response = scan_database(State(state), Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn test_get_schema_returns_not_implemented_for_unsupported_protocol() {
+        let config = AppConfig::default();
+        let state = AppState::new(
+            config,
+            "proxy.yaml".to_string(),
+            "localhost".to_string(),
+            3306,
+            DbProtocol::MySql,
+        );
+
+        let request = ScanConfig {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            database: "db".to_string(),
+            sample_size: 10,
+            schema: "public".to_string(),
+            exclude_tables: vec![],
+            confidence_threshold: 0.5,
+        };
+
+        let response = get_schema(State(state), Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
 }
