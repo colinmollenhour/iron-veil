@@ -16,6 +16,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Select } from "@/components/ui/select"
 import { motion, AnimatePresence } from "framer-motion"
+import { apiFetch } from "@/lib/api"
 
 interface MaskingRule {
   table: string | null
@@ -78,7 +79,7 @@ export default function RulesPage() {
 
   const fetchRules = async () => {
     try {
-      const res = await fetch("http://localhost:3001/rules")
+      const res = await apiFetch("/rules")
       const data: ConfigResponse = await res.json()
       setRules(data.rules)
     } catch (error) {
@@ -99,7 +100,7 @@ export default function RulesPage() {
         table: newRule.table === "" ? null : newRule.table
       }
 
-      await fetch("http://localhost:3001/rules", {
+      await apiFetch("/rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(ruleToSend)
@@ -115,7 +116,7 @@ export default function RulesPage() {
 
   const handleSaveFromTest = async (rule: { table: string; column: string; strategy: string }) => {
     try {
-      await fetch("http://localhost:3001/rules", {
+      await apiFetch("/rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -133,7 +134,7 @@ export default function RulesPage() {
   const handleDeleteRule = async (idx: number) => {
     const rule = rules[idx]
     try {
-      await fetch("http://localhost:3001/rules/delete", {
+      await apiFetch("/rules/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -451,4 +452,3 @@ export default function RulesPage() {
     </div>
   )
 }
-

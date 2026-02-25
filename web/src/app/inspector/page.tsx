@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { Activity } from "lucide-react"
+import { apiFetch } from "@/lib/api"
 
 interface LogEntry {
   id: string
@@ -27,7 +28,7 @@ export default function InspectorPage() {
   useEffect(() => {
     const fetchLogs = async () => {
       try {
-        const res = await fetch("http://localhost:3001/logs")
+        const res = await apiFetch("/logs")
         const data = await res.json()
         setLogs(data.logs)
       } catch (error) {

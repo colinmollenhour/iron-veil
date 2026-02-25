@@ -9,8 +9,7 @@ import { Badge } from "@/components/ui/badge"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { Label } from "@/components/ui/label"
 import { motion } from "framer-motion"
-
-const API_BASE = "http://localhost:3001"
+import { apiFetch } from "@/lib/api"
 
 export default function SettingsPage() {
   const [config, setConfig] = useState<{ masking_enabled: boolean; rules_count: number } | null>(null)
@@ -20,7 +19,7 @@ export default function SettingsPage() {
 
   const fetchConfig = async () => {
     try {
-      const res = await fetch(`${API_BASE}/config`)
+      const res = await apiFetch("/config")
       const data = await res.json()
       setConfig(data)
     } catch (error) {
@@ -32,7 +31,7 @@ export default function SettingsPage() {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch(`${API_BASE}/health`)
+      const res = await apiFetch("/health")
       const data = await res.json()
       setVersion(data?.version ?? null)
     } catch (error) {
@@ -49,7 +48,7 @@ export default function SettingsPage() {
     if (!config) return
     setIsSaving(true)
     try {
-      const res = await fetch(`${API_BASE}/config`, {
+      const res = await apiFetch("/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ masking_enabled: !config.masking_enabled })
@@ -65,7 +64,7 @@ export default function SettingsPage() {
 
   const handleExport = async () => {
     try {
-      const res = await fetch(`${API_BASE}/rules`)
+      const res = await apiFetch("/rules")
       const data = await res.json()
       
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })

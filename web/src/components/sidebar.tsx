@@ -5,6 +5,7 @@ import Image from "next/image"
 import { usePathname } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import { cn } from "@/lib/utils"
+import { apiFetch } from "@/lib/api"
 import {
   LayoutDashboard,
   ShieldAlert,
@@ -13,8 +14,6 @@ import {
   ScanSearch,
   Database
 } from "lucide-react"
-
-const API_BASE = "http://localhost:3001"
 
 const routes = [
   {
@@ -53,7 +52,7 @@ export function Sidebar() {
   
   const { data: health } = useQuery({
     queryKey: ["health"],
-    queryFn: () => fetch(`${API_BASE}/health`).then((res) => res.json()),
+    queryFn: () => apiFetch("/health").then((res) => res.json()),
     refetchInterval: 5000,
   })
 

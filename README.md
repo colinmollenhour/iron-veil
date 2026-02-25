@@ -324,6 +324,14 @@ cargo fmt
 cd web && npm install && npm run build
 ```
 
+### Web API Configuration
+
+The dashboard reads API settings from optional `NEXT_PUBLIC_*` variables:
+
+- `NEXT_PUBLIC_API_BASE_URL` (default: `http://localhost:3001`)
+- `NEXT_PUBLIC_IRONVEIL_API_KEY` (sent as `X-API-Key`)
+- `NEXT_PUBLIC_IRONVEIL_BEARER_TOKEN` (sent as `Authorization: Bearer ...`)
+
 ## Testing with Docker
 
 ```bash

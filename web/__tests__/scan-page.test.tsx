@@ -61,4 +61,34 @@ describe("ScanPage", () => {
     expect(await screen.findByText("users.email")).toBeInTheDocument()
     expect(await screen.findByText("Email")).toBeInTheDocument()
   })
+
+  it("sends custom scan connection settings from form fields", async () => {
+    const user = userEvent.setup()
+    render(<ScanPage />)
+
+    await user.clear(screen.getByLabelText(/username/i))
+    await user.type(screen.getByLabelText(/username/i), "alice")
+    await user.clear(screen.getByLabelText(/password/i))
+    await user.type(screen.getByLabelText(/password/i), "secret")
+    await user.clear(screen.getByLabelText(/database/i))
+    await user.type(screen.getByLabelText(/database/i), "customerdb")
+    await user.clear(screen.getByLabelText(/schema/i))
+    await user.type(screen.getByLabelText(/schema/i), "analytics")
+
+    await user.click(screen.getByRole("button", { name: /start new scan/i }))
+
+    await waitFor(() => {
+      const fetchMock = global.fetch as jest.Mock
+      const scanCall = fetchMock.mock.calls.find((call) => call[0] === "http://localhost:3001/scan")
+      expect(scanCall).toBeDefined()
+
+      const scanOptions = scanCall?.[1] as RequestInit
+      const body = JSON.parse(scanOptions.body as string)
+
+      expect(body.username).toBe("alice")
+      expect(body.password).toBe("secret")
+      expect(body.database).toBe("customerdb")
+      expect(body.schema).toBe("analytics")
+    })
+  })
 })

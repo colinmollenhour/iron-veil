@@ -2,6 +2,7 @@
 
 import { useState } from "react"
 import { ScanSearch, ShieldCheck, AlertTriangle, Loader2, CheckCircle } from "lucide-react"
+import { apiFetch } from "@/lib/api"
 
 interface Finding {
   table: string
@@ -12,11 +13,30 @@ interface Finding {
   sample?: string
 }
 
+interface ScanFormState {
+  username: string
+  password: string
+  database: string
+  schema: string
+  sampleSize: number
+  confidenceThreshold: number
+  excludeTables: string
+}
+
 export default function ScanPage() {
   const [isScanning, setIsScanning] = useState(false)
   const [findings, setFindings] = useState<Finding[]>([])
   const [scanComplete, setScanComplete] = useState(false)
   const [appliedRules, setAppliedRules] = useState<Set<string>>(new Set())
+  const [scanForm, setScanForm] = useState<ScanFormState>({
+    username: "postgres",
+    password: "password",
+    database: "postgres",
+    schema: "public",
+    sampleSize: 100,
+    confidenceThreshold: 0.5,
+    excludeTables: "",
+  })
 
   const startScan = async () => {
     setIsScanning(true)
@@ -24,17 +44,20 @@ export default function ScanPage() {
     setFindings([])
     
     try {
-      const res = await fetch("http://localhost:3001/scan", {
+      const res = await apiFetch("/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username: "postgres",
-          password: "password",
-          database: "postgres",
-          schema: "public",
-          sample_size: 100,
-          confidence_threshold: 0.5,
-          exclude_tables: []
+          username: scanForm.username,
+          password: scanForm.password,
+          database: scanForm.database,
+          schema: scanForm.schema,
+          sample_size: scanForm.sampleSize,
+          confidence_threshold: scanForm.confidenceThreshold,
+          exclude_tables: scanForm.excludeTables
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean),
         })
       })
       const data = await res.json()
@@ -56,7 +79,7 @@ export default function ScanPage() {
     const detectedType = finding.type || finding.pii_type || ""
     
     try {
-      await fetch("http://localhost:3001/rules", {
+      await apiFetch("/rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -104,6 +127,101 @@ export default function ScanPage() {
             </>
           )}
         </button>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
+        <div>
+          <label htmlFor="scan-username" className="block text-xs font-medium text-gray-400 mb-1">
+            Username
+          </label>
+          <input
+            id="scan-username"
+            value={scanForm.username}
+            onChange={(e) => setScanForm((prev) => ({ ...prev, username: e.target.value }))}
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
+        <div>
+          <label htmlFor="scan-password" className="block text-xs font-medium text-gray-400 mb-1">
+            Password
+          </label>
+          <input
+            id="scan-password"
+            type="password"
+            value={scanForm.password}
+            onChange={(e) => setScanForm((prev) => ({ ...prev, password: e.target.value }))}
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
+        <div>
+          <label htmlFor="scan-database" className="block text-xs font-medium text-gray-400 mb-1">
+            Database
+          </label>
+          <input
+            id="scan-database"
+            value={scanForm.database}
+            onChange={(e) => setScanForm((prev) => ({ ...prev, database: e.target.value }))}
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
+        <div>
+          <label htmlFor="scan-schema" className="block text-xs font-medium text-gray-400 mb-1">
+            Schema
+          </label>
+          <input
+            id="scan-schema"
+            value={scanForm.schema}
+            onChange={(e) => setScanForm((prev) => ({ ...prev, schema: e.target.value }))}
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
+        <div>
+          <label htmlFor="scan-sample-size" className="block text-xs font-medium text-gray-400 mb-1">
+            Sample Size
+          </label>
+          <input
+            id="scan-sample-size"
+            type="number"
+            min={1}
+            value={scanForm.sampleSize}
+            onChange={(e) =>
+              setScanForm((prev) => ({ ...prev, sampleSize: Number(e.target.value) || 1 }))
+            }
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
+        <div>
+          <label htmlFor="scan-confidence" className="block text-xs font-medium text-gray-400 mb-1">
+            Confidence
+          </label>
+          <input
+            id="scan-confidence"
+            type="number"
+            min={0}
+            max={1}
+            step={0.1}
+            value={scanForm.confidenceThreshold}
+            onChange={(e) =>
+              setScanForm((prev) => ({
+                ...prev,
+                confidenceThreshold: Math.min(1, Math.max(0, Number(e.target.value) || 0)),
+              }))
+            }
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
+        <div className="lg:col-span-2">
+          <label htmlFor="scan-exclude-tables" className="block text-xs font-medium text-gray-400 mb-1">
+            Exclude Tables (comma-separated)
+          </label>
+          <input
+            id="scan-exclude-tables"
+            value={scanForm.excludeTables}
+            onChange={(e) => setScanForm((prev) => ({ ...prev, excludeTables: e.target.value }))}
+            placeholder="migrations, audit_logs"
+            className="w-full rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-white"
+          />
+        </div>
       </div>
 
       {/* Results Area */}

@@ -8,6 +8,7 @@ import { ConnectionsChart, MultiLineChart } from "@/components/charts"
 import { MaskingStatsChart } from "@/components/charts"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
+import { apiFetch } from "@/lib/api"
 import { 
   Activity, 
   ShieldCheck, 
@@ -18,8 +19,6 @@ import {
   RefreshCw
 } from "lucide-react"
 import { motion, AnimatePresence } from "framer-motion"
-
-const API_BASE = "http://localhost:3001"
 
 // Types for stats API response
 interface StatsResponse {
@@ -65,24 +64,24 @@ interface LogEntry {
 export default function DashboardPage() {
   const { data: health } = useQuery({
     queryKey: ["health"],
-    queryFn: () => fetch(`${API_BASE}/health`).then((res) => res.json()),
+    queryFn: () => apiFetch("/health").then((res) => res.json()),
     refetchInterval: 5000,
   })
 
   const { data: stats } = useQuery<StatsResponse>({
     queryKey: ["stats"],
-    queryFn: () => fetch(`${API_BASE}/stats`).then((res) => res.json()),
+    queryFn: () => apiFetch("/stats").then((res) => res.json()),
     refetchInterval: 2000,
   })
 
   const { data: rules } = useQuery({
     queryKey: ["rules"],
-    queryFn: () => fetch(`${API_BASE}/rules`).then((res) => res.json()),
+    queryFn: () => apiFetch("/rules").then((res) => res.json()),
   })
 
   const { data: logs } = useQuery({
     queryKey: ["logs"],
-    queryFn: () => fetch(`${API_BASE}/logs`).then((res) => res.json()),
+    queryFn: () => apiFetch("/logs").then((res) => res.json()),
     refetchInterval: 3000,
   })
 
@@ -413,4 +412,3 @@ export default function DashboardPage() {
     </div>
   )
 }
-

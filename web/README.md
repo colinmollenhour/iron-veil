@@ -7,7 +7,7 @@ The web dashboard for IronVeil database proxy. Built with Next.js 16, React 19, 
 - **Dashboard**: Real-time system status with live charts, connection graphs, and masking statistics
 - **Masking Rules**: View, add, test, and manage data masking rules with live preview
 - **Rule Testing**: Test masking strategies with sample data before saving
-- **PII Scanner**: Scan database for potential PII columns with one-click rule creation
+- **PII Scanner**: Scan database for potential PII columns with editable connection settings and one-click rule creation
 - **Live Inspector**: Real-time query monitoring with masked data details
 - **Settings**: Global masking controls, theme selection, and configuration export
 - **Theme Support**: Dark, light, and system themes with persistent preference
@@ -170,6 +170,19 @@ npx tsc --noEmit
 # Build for production
 npm run build
 ```
+
+## API Configuration
+
+The dashboard uses these optional client-side settings:
+
+- `NEXT_PUBLIC_API_BASE_URL`: Override API origin (default: `http://localhost:3001`)
+- `NEXT_PUBLIC_IRONVEIL_API_KEY`: Optional API key header (`X-API-Key`)
+- `NEXT_PUBLIC_IRONVEIL_BEARER_TOKEN`: Optional bearer token (`Authorization: Bearer ...`)
+
+At runtime in the browser, you can also override auth via local storage keys:
+
+- `ironveil.api_key`
+- `ironveil.jwt`
 
 ## Screenshots
 
