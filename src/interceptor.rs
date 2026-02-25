@@ -181,14 +181,10 @@ impl PacketInterceptor for Anonymizer {
         for (i, field) in msg.fields.iter().enumerate() {
             for rule in &config.rules {
                 // Check if rule applies to this column
-                let table_match = rule.table.as_ref().is_none_or(|_t| {
-                    // TODO: In a real app, we'd need to resolve table OID to name.
-                    // For now, we assume the rule matches if table is None (global)
-                    // or if we could somehow know the table name (which we don't easily from RowDescription alone without a cache).
-                    // So for MVP, we'll ignore table name matching in RowDescription and just match on column name.
-                    // A proper implementation would query pg_class to map OID -> Name.
-                    true
-                });
+                // PostgreSQL RowDescription includes table OID but not table name.
+                // Until OID->name resolution is implemented, only global (table-less) rules
+                // are safe to apply here.
+                let table_match = rule.table.is_none();
 
                 // Convert Bytes field name to str for comparison
                 let field_name = std::str::from_utf8(&field.name).unwrap_or("");
@@ -623,6 +619,54 @@ mod tests {
         assert!(
             !val0.contains("@"),
             "Should be masked as address, not email"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_postgres_table_scoped_rule_not_applied_without_table_resolution() {
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![MaskingRule {
+                table: Some("users".to_string()),
+                column: "email_col".to_string(),
+                strategy: "address".to_string(),
+            }],
+            tls: None,
+            upstream_tls: false,
+            telemetry: None,
+            api: None,
+            limits: None,
+            health_check: None,
+            audit: None,
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = Anonymizer::new(state, 1);
+
+        let desc = RowDescription {
+            fields: vec![FieldDescription {
+                name: bytes::Bytes::from_static(b"email_col"),
+                table_oid: 123,
+                column_index: 1,
+                type_oid: 0,
+                type_len: 0,
+                type_modifier: 0,
+                format_code: 0,
+            }],
+        };
+
+        anonymizer.on_row_description(&desc).await;
+
+        let original = "plain_value";
+        let mut row = DataRow {
+            values: vec![Some(BytesMut::from(original.as_bytes()))],
+        };
+
+        row = anonymizer.on_data_row(row).await.unwrap();
+        let masked = std::str::from_utf8(row.values[0].as_ref().unwrap()).unwrap();
+
+        assert_eq!(
+            masked, original,
+            "PostgreSQL table-scoped rules must not apply without table-name resolution"
         );
     }
 

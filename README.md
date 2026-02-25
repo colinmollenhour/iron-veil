@@ -12,7 +12,7 @@
 *   **Real-time Anonymization**: Masks PII data in database result sets on the fly.
 *   **Multi-Database Support**: Works with both **PostgreSQL** and **MySQL** wire protocols.
 *   **Zero-Copy Parsing**: Built with `tokio` and `bytes` for high throughput and low latency.
-*   **Configurable Rules**: Define masking strategies per table and column via `proxy.yaml`.
+*   **Configurable Rules**: Define masking strategies per column via `proxy.yaml` (table-scoped matching is fully supported for MySQL).
 *   **TLS Support**: Client-to-proxy and proxy-to-upstream TLS encryption.
 
 ### PII Detection
@@ -159,6 +159,12 @@ rules:
 | `address` | Generates fake city name | `Springfield` |
 | `credit_card` | Generates fake CC number | `4532-xxxx-xxxx-1234` |
 | `json` | Recursively masks PII in JSON | `{"email": "fake@example.com"}` |
+
+### Rule Matching Notes
+
+- MySQL: `table` + `column` rules are enforced as configured.
+- PostgreSQL: due to wire-protocol metadata limits in `RowDescription`, only global `column` rules are currently applied at runtime.
+- For PostgreSQL, prefer global column rules until table OID-to-name resolution is implemented.
 
 ### PII Types Auto-Detected
 

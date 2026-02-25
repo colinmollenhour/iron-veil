@@ -151,6 +151,11 @@ The dashboard connects to the IronVeil Management API:
 }
 ```
 
+## Rule Matching Notes
+
+- MySQL runtime masking supports table-scoped rules (`table` + `column`).
+- PostgreSQL runtime masking currently applies global column rules only.
+
 ## Development
 
 ```bash
