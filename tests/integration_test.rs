@@ -39,6 +39,38 @@ async fn is_api_running() -> bool {
     )
 }
 
+async fn assert_protected_json_response(
+    resp: reqwest::Response,
+    expected_success_key: &str,
+    endpoint_name: &str,
+) {
+    let status = resp.status().as_u16();
+    if status == 200 {
+        let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON body");
+        assert!(
+            body.get(expected_success_key).is_some(),
+            "Expected '{}' key in {} success response",
+            expected_success_key,
+            endpoint_name
+        );
+    } else if status == 401 {
+        let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON body");
+        assert_eq!(
+            body.get("error").and_then(|v| v.as_str()),
+            Some("Authentication required"),
+            "{} unauthorized response should include auth error",
+            endpoint_name
+        );
+        assert!(
+            body.get("methods").is_some(),
+            "{} unauthorized response should include auth methods",
+            endpoint_name
+        );
+    } else {
+        panic!("{} should return 200 or 401, got {}", endpoint_name, status);
+    }
+}
+
 mod api_tests {
     use super::*;
 
@@ -80,11 +112,11 @@ mod api_tests {
             .await
             .expect("Failed to send request");
 
-        // Metrics endpoint should exist (200) or return 404 if not configured
+        // Metrics endpoint should return data (200) or service unavailable (503) if disabled.
         let status = resp.status().as_u16();
         assert!(
-            status == 200 || status == 404,
-            "Metrics endpoint should return 200 or 404, got: {}",
+            status == 200 || status == 503,
+            "Metrics endpoint should return 200 or 503, got: {}",
             status
         );
 
@@ -94,6 +126,12 @@ mod api_tests {
             assert!(
                 body.contains("ironveil_") || body.contains("# ") || body.is_empty(),
                 "Metrics should contain ironveil_ prefix, Prometheus comments, or be empty"
+            );
+        } else {
+            let body = resp.text().await.expect("Failed to get response text");
+            assert!(
+                body.contains("Metrics not enabled"),
+                "503 response should indicate metrics are disabled"
             );
         }
     }
@@ -114,13 +152,7 @@ mod api_tests {
             .await
             .expect("Failed to send request");
 
-        // Should return 200 (no auth) or 401 (auth required)
-        let status = resp.status().as_u16();
-        assert!(
-            status == 200 || status == 401,
-            "Rules endpoint should return 200 or 401, got: {}",
-            status
-        );
+        assert_protected_json_response(resp, "rules", "/rules").await;
     }
 
     /// Test rules endpoint with API key
@@ -140,13 +172,7 @@ mod api_tests {
             .await
             .expect("Failed to send request");
 
-        // Should succeed with valid API key (assuming this is the configured key)
-        // If not configured, this may still fail - that's expected
-        let status = resp.status().as_u16();
-        assert!(
-            status == 200 || status == 401,
-            "Should return 200 (valid key) or 401 (invalid key)"
-        );
+        assert_protected_json_response(resp, "rules", "/rules (api key)").await;
     }
 
     /// Test config endpoint
@@ -166,12 +192,7 @@ mod api_tests {
             .await
             .expect("Failed to send request");
 
-        let status = resp.status().as_u16();
-        // Config endpoint requires auth, so 200 or 401
-        assert!(
-            status == 200 || status == 401,
-            "Config endpoint should respond"
-        );
+        assert_protected_json_response(resp, "masking_enabled", "/config").await;
     }
 
     /// Test connections endpoint
@@ -191,11 +212,7 @@ mod api_tests {
             .await
             .expect("Failed to send request");
 
-        let status = resp.status().as_u16();
-        assert!(
-            status == 200 || status == 401,
-            "Connections endpoint should respond"
-        );
+        assert_protected_json_response(resp, "active_connections", "/connections").await;
     }
 }
 
