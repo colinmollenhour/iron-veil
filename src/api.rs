@@ -1184,4 +1184,58 @@ mod tests {
             .into_response();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
+
+    #[tokio::test]
+    async fn test_scan_database_returns_unauthorized_for_missing_credentials() {
+        let config = AppConfig::default();
+        let state = AppState::new(
+            config,
+            "proxy.yaml".to_string(),
+            "localhost".to_string(),
+            5432,
+            DbProtocol::Postgres,
+        );
+
+        let request = ScanConfig {
+            username: "".to_string(),
+            password: "".to_string(),
+            database: "db".to_string(),
+            sample_size: 10,
+            schema: "public".to_string(),
+            exclude_tables: vec![],
+            confidence_threshold: 0.5,
+        };
+
+        let response = scan_database(State(state), Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_get_schema_returns_unauthorized_for_missing_credentials() {
+        let config = AppConfig::default();
+        let state = AppState::new(
+            config,
+            "proxy.yaml".to_string(),
+            "localhost".to_string(),
+            5432,
+            DbProtocol::Postgres,
+        );
+
+        let request = ScanConfig {
+            username: "".to_string(),
+            password: "".to_string(),
+            database: "db".to_string(),
+            sample_size: 10,
+            schema: "public".to_string(),
+            exclude_tables: vec![],
+            confidence_threshold: 0.5,
+        };
+
+        let response = get_schema(State(state), Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

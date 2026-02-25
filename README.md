@@ -223,7 +223,12 @@ The management API runs on port 3001 by default.
 }
 ```
 
-If IronVeil is running with `--protocol mysql`, `/scan` and `/schema` currently return `501 Not Implemented` with code `unsupported_protocol`.
+`POST /scan` and `POST /schema` can return:
+
+- `401 Unauthorized` with code `auth_required` when `username` or `password` is missing/blank.
+- `501 Not Implemented` with code `unsupported_protocol` when IronVeil runs with `--protocol mysql`.
+- `502 Bad Gateway` with code `connection_failed` when upstream DB connection fails.
+- `500 Internal Server Error` with code `query_failed` when schema/query execution fails after connection.
 
 ### Authentication
 

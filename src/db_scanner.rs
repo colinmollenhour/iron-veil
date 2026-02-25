@@ -20,7 +20,6 @@ pub enum ScanError {
     QueryFailed(String),
     #[error("Unsupported database protocol: {0:?}")]
     UnsupportedProtocol(DbProtocol),
-    #[allow(dead_code)]
     #[error("Authentication required: please provide database credentials")]
     AuthRequired,
 }
@@ -135,6 +134,10 @@ impl DbScanner {
     pub async fn scan(&self, config: &ScanConfig) -> Result<ScanResult, ScanError> {
         let start = std::time::Instant::now();
 
+        if !Self::has_required_credentials(config) {
+            return Err(ScanError::AuthRequired);
+        }
+
         match self.protocol {
             DbProtocol::Postgres => self.scan_postgres(config, start).await,
             DbProtocol::MySql => {
@@ -147,10 +150,18 @@ impl DbScanner {
     /// Get schema information from the database
     #[instrument(skip(self, config), fields(host = %self.host, port = %self.port, db = %config.database))]
     pub async fn get_schema(&self, config: &ScanConfig) -> Result<SchemaInfo, ScanError> {
+        if !Self::has_required_credentials(config) {
+            return Err(ScanError::AuthRequired);
+        }
+
         match self.protocol {
             DbProtocol::Postgres => self.get_postgres_schema(config).await,
             DbProtocol::MySql => Err(ScanError::UnsupportedProtocol(DbProtocol::MySql)),
         }
+    }
+
+    fn has_required_credentials(config: &ScanConfig) -> bool {
+        !config.username.trim().is_empty() && !config.password.trim().is_empty()
     }
 
     /// Scan PostgreSQL database for PII
