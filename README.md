@@ -305,13 +305,13 @@ ironveil_idle_timeouts_total
 ## Development
 
 ```bash
-# Run tests (79 tests total)
+# Run all tests
 cargo test
 
-# Run only unit tests (62 tests)
+# Run only unit tests
 cargo test --bin iron-veil
 
-# Run only integration tests (17 tests)
+# Run only integration tests
 cargo test --test integration_test
 
 # Check for issues
