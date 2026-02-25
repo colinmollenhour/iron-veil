@@ -2,7 +2,7 @@
 
 import { useState } from "react"
 import { ScanSearch, ShieldCheck, AlertTriangle, Loader2, CheckCircle } from "lucide-react"
-import { apiFetch } from "@/lib/api"
+import { ApiError, apiFetchJson } from "@/lib/api"
 
 interface Finding {
   table: string
@@ -27,6 +27,7 @@ export default function ScanPage() {
   const [isScanning, setIsScanning] = useState(false)
   const [findings, setFindings] = useState<Finding[]>([])
   const [scanComplete, setScanComplete] = useState(false)
+  const [scanError, setScanError] = useState<string | null>(null)
   const [appliedRules, setAppliedRules] = useState<Set<string>>(new Set())
   const [scanForm, setScanForm] = useState<ScanFormState>({
     username: "postgres",
@@ -42,9 +43,10 @@ export default function ScanPage() {
     setIsScanning(true)
     setScanComplete(false)
     setFindings([])
+    setScanError(null)
     
     try {
-      const res = await apiFetch("/scan", {
+      const data = await apiFetchJson<{ findings?: Finding[] }>("/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -60,7 +62,6 @@ export default function ScanPage() {
             .filter(Boolean),
         })
       })
-      const data = await res.json()
       const normalizedFindings: Finding[] = (data.findings || []).map((finding: Finding) => ({
         ...finding,
         type: finding.type || finding.pii_type || "Unknown"
@@ -68,6 +69,10 @@ export default function ScanPage() {
       setFindings(normalizedFindings)
       setScanComplete(true)
     } catch (error) {
+      const message = error instanceof ApiError
+        ? error.message
+        : "Scan failed. Please try again."
+      setScanError(message)
       console.error("Scan failed:", error)
     } finally {
       setIsScanning(false)
@@ -79,7 +84,7 @@ export default function ScanPage() {
     const detectedType = finding.type || finding.pii_type || ""
     
     try {
-      await apiFetch("/rules", {
+      await apiFetchJson<Record<string, unknown>>("/rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -128,6 +133,12 @@ export default function ScanPage() {
           )}
         </button>
       </div>
+
+      {scanError && (
+        <div className="rounded-lg border border-red-700/40 bg-red-900/20 px-4 py-3 text-red-300" role="alert">
+          {scanError}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 bg-gray-900/50 border border-gray-800 rounded-xl p-4">
         <div>

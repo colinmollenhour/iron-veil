@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { Label } from "@/components/ui/label"
 import { motion } from "framer-motion"
-import { apiFetch } from "@/lib/api"
+import { apiFetchJson } from "@/lib/api"
 
 type HealthResponse = {
   version?: string
@@ -23,13 +23,6 @@ type HealthResponse = {
 type ConfigResponse = {
   masking_enabled: boolean
   rules_count: number
-}
-
-async function parseJsonResponse<T>(res: Response, endpoint: string): Promise<T> {
-  if (!res.ok) {
-    throw new Error(`Request to ${endpoint} failed with status ${res.status}`)
-  }
-  return (await res.json()) as T
 }
 
 function formatProtocolLabel(protocol: string | null): string {
@@ -61,8 +54,7 @@ export default function SettingsPage() {
 
   const fetchConfig = async () => {
     try {
-      const res = await apiFetch("/config")
-      const data = await parseJsonResponse<ConfigResponse>(res, "/config")
+      const data = await apiFetchJson<ConfigResponse>("/config")
       if (typeof data.masking_enabled !== "boolean" || typeof data.rules_count !== "number") {
         throw new Error("Invalid /config response shape")
       }
@@ -76,8 +68,7 @@ export default function SettingsPage() {
 
   const fetchHealth = async () => {
     try {
-      const res = await apiFetch("/health")
-      const data = await parseJsonResponse<HealthResponse>(res, "/health")
+      const data = await apiFetchJson<HealthResponse>("/health")
       setVersion(data?.version ?? null)
       setUpstreamHost(data?.upstream?.host ?? null)
       setUpstreamPort(typeof data?.upstream?.port === "number" ? data.upstream.port : null)
@@ -120,12 +111,11 @@ export default function SettingsPage() {
     if (!config) return
     setIsSaving(true)
     try {
-      const res = await apiFetch("/config", {
+      const data = await apiFetchJson<{ masking_enabled?: unknown }>("/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ masking_enabled: !config.masking_enabled })
       })
-      const data = await parseJsonResponse<{ masking_enabled?: unknown }>(res, "/config")
       if (typeof data.masking_enabled !== "boolean") {
         throw new Error("Invalid /config update response shape")
       }
@@ -140,8 +130,7 @@ export default function SettingsPage() {
 
   const handleExport = async () => {
     try {
-      const res = await apiFetch("/rules")
-      const data = await parseJsonResponse<Record<string, unknown>>(res, "/rules")
+      const data = await apiFetchJson<Record<string, unknown>>("/rules")
       
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
       const url = window.URL.createObjectURL(blob)

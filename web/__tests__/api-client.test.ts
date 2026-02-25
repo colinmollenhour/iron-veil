@@ -47,4 +47,37 @@ describe("api client", () => {
       }),
     )
   })
+
+  it("parses JSON responses with apiFetchJson", async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ status: "ok", value: 42 }),
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    const { apiFetchJson } = await import("@/lib/api")
+    const payload = await apiFetchJson<{ status: string; value: number }>("/health")
+
+    expect(payload.status).toBe("ok")
+    expect(payload.value).toBe(42)
+  })
+
+  it("throws ApiError for non-OK JSON responses", async () => {
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({ error: "Authentication required", code: "auth_required" }),
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    const { apiFetchJson, ApiError } = await import("@/lib/api")
+
+    await expect(apiFetchJson("/rules")).rejects.toBeInstanceOf(ApiError)
+    await expect(apiFetchJson("/rules")).rejects.toMatchObject({
+      status: 401,
+      code: "auth_required",
+      message: "Authentication required",
+    })
+  })
 })

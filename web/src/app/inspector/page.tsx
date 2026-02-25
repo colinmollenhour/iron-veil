@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react"
 import { Activity } from "lucide-react"
-import { apiFetch } from "@/lib/api"
+import { apiFetchJson } from "@/lib/api"
 
 interface LogEntry {
   id: string
@@ -28,9 +28,8 @@ export default function InspectorPage() {
   useEffect(() => {
     const fetchLogs = async () => {
       try {
-        const res = await apiFetch("/logs")
-        const data = await res.json()
-        setLogs(data.logs)
+        const data = await apiFetchJson<{ logs?: LogEntry[] }>("/logs")
+        setLogs(data.logs ?? [])
       } catch (error) {
         console.error("Failed to fetch logs", error)
       }

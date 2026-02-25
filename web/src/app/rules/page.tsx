@@ -16,7 +16,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Select } from "@/components/ui/select"
 import { motion, AnimatePresence } from "framer-motion"
-import { apiFetch } from "@/lib/api"
+import { apiFetchJson } from "@/lib/api"
 
 interface MaskingRule {
   table: string | null
@@ -79,8 +79,7 @@ export default function RulesPage() {
 
   const fetchRules = async () => {
     try {
-      const res = await apiFetch("/rules")
-      const data: ConfigResponse = await res.json()
+      const data = await apiFetchJson<ConfigResponse>("/rules")
       setRules(data.rules)
     } catch (error) {
       console.error("Failed to fetch rules:", error)
@@ -100,7 +99,7 @@ export default function RulesPage() {
         table: newRule.table === "" ? null : newRule.table
       }
 
-      await apiFetch("/rules", {
+      await apiFetchJson<Record<string, unknown>>("/rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(ruleToSend)
@@ -116,7 +115,7 @@ export default function RulesPage() {
 
   const handleSaveFromTest = async (rule: { table: string; column: string; strategy: string }) => {
     try {
-      await apiFetch("/rules", {
+      await apiFetchJson<Record<string, unknown>>("/rules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -134,7 +133,7 @@ export default function RulesPage() {
   const handleDeleteRule = async (idx: number) => {
     const rule = rules[idx]
     try {
-      await apiFetch("/rules/delete", {
+      await apiFetchJson<Record<string, unknown>>("/rules/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

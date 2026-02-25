@@ -2,8 +2,56 @@ const DEFAULT_API_BASE_URL = "http://localhost:3001"
 const API_KEY_STORAGE_KEY = "ironveil.api_key"
 const JWT_STORAGE_KEY = "ironveil.jwt"
 
+type ApiErrorOptions = {
+  status: number
+  endpoint: string
+  code?: string
+  payload?: unknown
+}
+
+type ApiErrorPayload = {
+  error?: string
+  code?: string
+}
+
+export class ApiError extends Error {
+  status: number
+  endpoint: string
+  code?: string
+  payload?: unknown
+
+  constructor(message: string, options: ApiErrorOptions) {
+    super(message)
+    this.name = "ApiError"
+    this.status = options.status
+    this.endpoint = options.endpoint
+    this.code = options.code
+    this.payload = options.payload
+  }
+}
+
 function trimTrailingSlash(value: string): string {
   return value.endsWith("/") ? value.slice(0, -1) : value
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function getResponseStatus(response: Response): number {
+  return typeof response.status === "number" ? response.status : 200
+}
+
+function isResponseOk(response: Response): boolean {
+  return typeof response.ok === "boolean" ? response.ok : true
+}
+
+async function readJsonSafely(response: Response): Promise<unknown> {
+  try {
+    return await response.json()
+  } catch {
+    return undefined
+  }
 }
 
 function headersToRecord(headers?: HeadersInit): Record<string, string> {
@@ -75,4 +123,27 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   }
 
   return fetch(buildApiUrl(path), requestInit)
+}
+
+export async function apiFetchJson<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+  const response = await apiFetch(path, init)
+  const payload = await readJsonSafely(response)
+  const status = getResponseStatus(response)
+
+  if (!isResponseOk(response)) {
+    const errorPayload = isRecord(payload) ? (payload as ApiErrorPayload) : undefined
+    const message = typeof errorPayload?.error === "string"
+      ? errorPayload.error
+      : `Request to ${path} failed with status ${status}`
+    const code = typeof errorPayload?.code === "string" ? errorPayload.code : undefined
+
+    throw new ApiError(message, {
+      status,
+      endpoint: path,
+      code,
+      payload,
+    })
+  }
+
+  return payload as T
 }

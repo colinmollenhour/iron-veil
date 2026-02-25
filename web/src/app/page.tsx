@@ -8,7 +8,7 @@ import { ConnectionsChart, MultiLineChart } from "@/components/charts"
 import { MaskingStatsChart } from "@/components/charts"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
-import { apiFetch } from "@/lib/api"
+import { apiFetchJson } from "@/lib/api"
 import { 
   Activity, 
   ShieldCheck, 
@@ -61,27 +61,39 @@ interface LogEntry {
   content: string
 }
 
+interface HealthResponse {
+  status?: string
+}
+
+interface RulesResponse {
+  rules?: Array<unknown>
+}
+
+interface LogsResponse {
+  logs?: LogEntry[]
+}
+
 export default function DashboardPage() {
-  const { data: health } = useQuery({
+  const { data: health } = useQuery<HealthResponse>({
     queryKey: ["health"],
-    queryFn: () => apiFetch("/health").then((res) => res.json()),
+    queryFn: () => apiFetchJson<HealthResponse>("/health"),
     refetchInterval: 5000,
   })
 
   const { data: stats } = useQuery<StatsResponse>({
     queryKey: ["stats"],
-    queryFn: () => apiFetch("/stats").then((res) => res.json()),
+    queryFn: () => apiFetchJson<StatsResponse>("/stats"),
     refetchInterval: 2000,
   })
 
-  const { data: rules } = useQuery({
+  const { data: rules } = useQuery<RulesResponse>({
     queryKey: ["rules"],
-    queryFn: () => apiFetch("/rules").then((res) => res.json()),
+    queryFn: () => apiFetchJson<RulesResponse>("/rules"),
   })
 
-  const { data: logs } = useQuery({
+  const { data: logs } = useQuery<LogsResponse>({
     queryKey: ["logs"],
-    queryFn: () => apiFetch("/logs").then((res) => res.json()),
+    queryFn: () => apiFetchJson<LogsResponse>("/logs"),
     refetchInterval: 3000,
   })
 

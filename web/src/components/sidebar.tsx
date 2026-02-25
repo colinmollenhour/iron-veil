@@ -5,7 +5,7 @@ import Image from "next/image"
 import { usePathname } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import { cn } from "@/lib/utils"
-import { apiFetch } from "@/lib/api"
+import { apiFetchJson } from "@/lib/api"
 import {
   LayoutDashboard,
   ShieldAlert,
@@ -47,12 +47,20 @@ const routes = [
   },
 ]
 
+type HealthResponse = {
+  version?: string
+  upstream?: {
+    healthy?: boolean
+    latency_ms?: number
+  }
+}
+
 export function Sidebar() {
   const pathname = usePathname()
   
-  const { data: health } = useQuery({
+  const { data: health } = useQuery<HealthResponse>({
     queryKey: ["health"],
-    queryFn: () => apiFetch("/health").then((res) => res.json()),
+    queryFn: () => apiFetchJson<HealthResponse>("/health"),
     refetchInterval: 5000,
   })
 

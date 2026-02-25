@@ -3,10 +3,14 @@ import userEvent from "@testing-library/user-event"
 import ScanPage from "@/app/scan/page"
 
 type FetchResponse = {
+  ok?: boolean
+  status?: number
   json: () => Promise<unknown>
 }
 
-const createResponse = (data: unknown): FetchResponse => ({
+const createResponse = (data: unknown, ok = true, status = ok ? 200 : 500): FetchResponse => ({
+  ok,
+  status,
   json: async () => data
 })
 
@@ -90,5 +94,24 @@ describe("ScanPage", () => {
       expect(body.database).toBe("customerdb")
       expect(body.schema).toBe("analytics")
     })
+  })
+
+  it("shows an error message when /scan returns non-OK", async () => {
+    const user = userEvent.setup()
+    const fetchMock = global.fetch as jest.Mock
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {})
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString()
+      if (url.endsWith("/scan")) {
+        return createResponse({ error: "Authentication required", code: "auth_required" }, false, 401) as Response
+      }
+      return createResponse({}) as Response
+    })
+
+    render(<ScanPage />)
+    await user.click(screen.getByRole("button", { name: /start new scan/i }))
+
+    expect(await screen.findByText("Authentication required")).toBeInTheDocument()
+    errorSpy.mockRestore()
   })
 })

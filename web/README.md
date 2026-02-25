@@ -206,6 +206,12 @@ At runtime in the browser, you can also override auth via local storage keys:
 
 The Settings page includes an **API Authentication** panel that writes these values for you.
 
+Frontend API behavior:
+
+- The shared client (`web/src/lib/api.ts`) throws an `ApiError` for non-2xx responses.
+- `ApiError` includes `status`, `code` (if present), `endpoint`, and parsed error payload.
+- Scanner UI surfaces backend errors (for example `auth_required`) directly in an alert banner.
+
 ## Screenshots
 
 ### Dashboard
