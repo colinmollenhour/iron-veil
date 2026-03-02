@@ -121,11 +121,11 @@ health_check:
 
 **Files:** `src/api.rs`, `src/state.rs`
 
-### 10. Prometheus Metrics (Grafana template pending)
+### 10. Prometheus Metrics ✅
 - [x] Add `/metrics` endpoint
 - [x] Track: connections (opened/closed/rejected), queries, masked fields, latency
 - [x] Integrate with `metrics` and `metrics-exporter-prometheus` crates
-- [ ] Add Grafana dashboard template (future enhancement)
+- [x] Add Grafana dashboard template (`monitoring/grafana/ironveil-dashboard.json`)
 
 **Metrics Exposed:**
 - `ironveil_connections_total` - Total connections received
@@ -139,8 +139,13 @@ health_check:
 - `ironveil_upstream_healthy` - Upstream health status (0/1)
 - `ironveil_upstream_timeouts_total` - Upstream connection timeouts
 - `ironveil_idle_timeouts_total` - Idle connection timeouts
+- `ironveil_upstream_pool_active_connections` - Current upstream pool usage
+- `ironveil_upstream_pool_size` - Configured upstream pool cap
+- `ironveil_upstream_pool_utilization_ratio` - Pool utilization ratio (0.0-1.0)
+- `ironveil_upstream_pool_wait_seconds` - Wait-time histogram for pool slot acquisition
+- `ironveil_upstream_pool_acquire_timeouts_total` - Timeouts while waiting for upstream pool slot
 
-**Files:** `src/metrics.rs` (new), `src/api.rs`, `src/state.rs`, `Cargo.toml`
+**Files:** `src/metrics.rs` (new), `src/api.rs`, `src/state.rs`, `Cargo.toml`, `monitoring/grafana/ironveil-dashboard.json`, `README.md`
 
 ### 11. Frontend Dynamic Version ✅
 - [x] Fetch version from `/health` endpoint (already implemented)
@@ -200,11 +205,15 @@ health_check:
 **Files:** `src/main.rs`, `src/state.rs`, `src/api.rs`, `Cargo.toml`
 
 ### 15. Connection Pooling
-- [ ] Implement upstream connection pooling
-- [ ] Reduce connection overhead
-- [ ] Add pool size configuration
+- [ ] Implement reusable upstream session pooling (protocol-safe reset/re-auth)
+- [x] Add upstream pool size and wait-time configuration guardrails
+- [x] Add upstream pool saturation and wait-time metrics
 
-**Files:** `src/main.rs`, `src/config.rs`
+**Status Note:**
+- Current implementation provides upstream slot management (`upstream_pool_size`) and visibility (`ironveil_upstream_pool_*` metrics).
+- Full reusable session pooling remains pending because PostgreSQL/MySQL session state requires safe reset semantics.
+
+**Files:** `src/main.rs`, `src/config.rs`, `src/metrics.rs`, `README.md`
 
 ### 16. Audit Logging ✅
 - [x] Log all configuration changes
@@ -305,7 +314,7 @@ audit:
 
 ## 🧭 Strategic Backlog (From FEATURE_IDEAS.md)
 
-These are high-value future enhancements. They are not yet included in the progress totals below.
+These are high-value future enhancements that extend the original production-readiness scope.
 
 ### 21. Tokenization Vault Mode
 - [ ] Add reversible, deterministic tokenization backed by KMS/HSM-managed keys
@@ -377,7 +386,27 @@ These are high-value future enhancements. They are not yet included in the progr
 | 🟡 High Priority | 5 | 5 | 0 |
 | 🟢 Medium Priority | 5 | 4 | 1 |
 | 🔵 Low Priority | 4 | 1 | 3 |
-| **Total** | **20** | **16** | **4** |
+| 🧭 Strategic Backlog | 12 | 0 | 12 |
+| **Total** | **32** | **16** | **16** |
+
+---
+
+## Recommended Execution Sequence (Post-v0.1.1)
+
+1. **Connection Pooling (Item #15 + #30 foundation)**
+- Implement upstream pool abstraction and pool-size config in `src/config.rs`
+- Integrate pool checkout lifecycle in protocol handlers in `src/main.rs`
+- Expand from current pool guardrails to reusable session pooling with safe reset semantics
+
+2. **Multi-Upstream Routing (Item #17 + #30)**
+- Add upstream registry and routing key strategy (db/user/tenant)
+- Enforce per-upstream limits and health-aware failover behavior
+- Add API/UI visibility for active upstream route decisions
+
+3. **Query Guardrails (Item #18 + #31)**
+- Introduce allow/deny and dangerous query heuristics (DROP, DELETE without WHERE)
+- Add policy-driven exception paths with audit entries
+- Add dry-run mode before hard-enforcement rollout
 
 ---
 
@@ -387,6 +416,7 @@ These are high-value future enhancements. They are not yet included in the progr
 - [x] Fix `unwrap()` calls (5 locations)
 - [x] Add connection timeout config
 - [x] Fetch version and upstream metadata dynamically in settings page
+- [x] Provide baseline Grafana dashboard template for Prometheus metrics
 
 ---
 

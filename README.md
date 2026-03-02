@@ -58,13 +58,21 @@
     docker compose up -d --build
     ```
 
-2.  **Access the Dashboard**:
-    Open [http://localhost:3000](http://localhost:3000) to view the control plane.
+2.  **Verify the Management API**:
+    Open [http://localhost:3001/health](http://localhost:3001/health) to confirm proxy and upstream status.
 
 3.  **Connect to the Proxy (PostgreSQL)**:
     ```bash
     psql -h 127.0.0.1 -p 6543 -U postgres
     ```
+
+4.  **Run the Web Dashboard (optional, separate process)**:
+    ```bash
+    cd web
+    npm install
+    npm run dev
+    ```
+    Then open [http://localhost:3000](http://localhost:3000).
 
 ### Running Locally
 
@@ -127,6 +135,8 @@ limits:
   connections_per_second: 100  # Optional: rate limit for new connections
   connect_timeout_secs: 30  # Upstream connection timeout (default: 30)
   idle_timeout_secs: 300  # Idle connection timeout (default: 300)
+  upstream_pool_size: 500  # Optional: cap concurrent upstream sessions
+  upstream_pool_wait_timeout_secs: 5  # Wait time for upstream slot before reject (default: 5)
 
 # Upstream Health Check
 health_check:
@@ -298,6 +308,9 @@ iron-veil/
 │       └── mysql.rs     # MySQL wire protocol codec
 ├── tests/
 │   └── integration_test.rs  # Integration tests (17 tests)
+├── monitoring/
+│   └── grafana/
+│       └── ironveil-dashboard.json  # Baseline Grafana dashboard
 ├── web/                 # Next.js dashboard
 ├── proxy.yaml           # Configuration file
 └── docker-compose.yml   # Full stack deployment
@@ -328,7 +341,26 @@ ironveil_upstream_healthy
 ironveil_upstream_health_check_latency_ms
 ironveil_upstream_timeouts_total
 ironveil_idle_timeouts_total
+
+# Upstream pool metrics
+ironveil_upstream_pool_active_connections
+ironveil_upstream_pool_size
+ironveil_upstream_pool_utilization_ratio
+ironveil_upstream_pool_wait_seconds
+ironveil_upstream_pool_acquire_timeouts_total
 ```
+
+### Grafana Dashboard Template
+
+Use the baseline dashboard at `monitoring/grafana/ironveil-dashboard.json`.
+
+Import steps:
+1. Open Grafana and go to **Dashboards** -> **New** -> **Import**.
+2. Upload `monitoring/grafana/ironveil-dashboard.json`.
+3. Select your Prometheus datasource when prompted.
+4. Save the dashboard as `IronVeil Overview`.
+
+The dashboard includes panels for upstream health, connection activity, query throughput/latency, masking operations, timeout rates, and upstream pool saturation/wait behavior.
 
 ## Development
 
@@ -363,11 +395,19 @@ The dashboard reads API settings from optional `NEXT_PUBLIC_*` variables:
 ## Testing with Docker
 
 ```bash
-# Start full stack (proxy + postgres + web dashboard)
+# Start backend stack (proxy + postgres)
 docker compose up -d
 
 # View logs
 docker compose logs -f proxy
+```
+
+Run the dashboard separately when needed:
+
+```bash
+cd web
+npm install
+npm run dev
 ```
 
 ## Testing OpenTelemetry

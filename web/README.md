@@ -131,6 +131,7 @@ The dashboard connects to the IronVeil Management API:
 | `/rules/delete` | POST | Delete a rule by index or column/table |
 | `/config` | GET | Get config summary (`masking_enabled`, `rules_count`) |
 | `/config` | POST | Update configuration |
+| `/stats` | GET | Get dashboard statistics (connections, queries, masking, history) |
 | `/connections` | GET | Get active connection count |
 | `/logs` | GET | Get recent query logs |
 | `/scan` | POST | Trigger PII scan (requires DB credential payload; PostgreSQL scanner currently) |
@@ -142,7 +143,7 @@ The dashboard connects to the IronVeil Management API:
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "upstream": {
     "host": "localhost",
     "port": 5432,
