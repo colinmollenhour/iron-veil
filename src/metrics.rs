@@ -5,6 +5,7 @@
 //! - Query processing metrics (count, latency)
 //! - Masking operations (fields masked, errors)
 //! - Upstream health check latency
+//! - Upstream pool usage and wait time
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -86,6 +87,31 @@ pub fn record_upstream_timeout() {
 #[allow(dead_code)]
 pub fn record_idle_timeout() {
     counter!("ironveil_idle_timeouts_total").increment(1);
+}
+
+/// Record wait time while acquiring an upstream pool slot.
+#[allow(dead_code)]
+pub fn record_upstream_pool_wait(duration_secs: f64) {
+    histogram!("ironveil_upstream_pool_wait_seconds").record(duration_secs);
+}
+
+/// Record timeout waiting for an upstream pool slot.
+#[allow(dead_code)]
+pub fn record_upstream_pool_acquire_timeout() {
+    counter!("ironveil_upstream_pool_acquire_timeouts_total").increment(1);
+}
+
+/// Set upstream pool utilization gauges.
+#[allow(dead_code)]
+pub fn set_upstream_pool_state(active: usize, max: usize) {
+    let utilization = if max == 0 {
+        0.0
+    } else {
+        active as f64 / max as f64
+    };
+    gauge!("ironveil_upstream_pool_active_connections").set(active as f64);
+    gauge!("ironveil_upstream_pool_size").set(max as f64);
+    gauge!("ironveil_upstream_pool_utilization_ratio").set(utilization);
 }
 
 #[cfg(test)]

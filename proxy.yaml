@@ -22,7 +22,11 @@ telemetry:
   otlp_endpoint: http://localhost:4317
   service_name: iron-veil
 api: null
-limits: null
+limits:
+  upstream_pool_size: 1
+  upstream_pool_wait_timeout_secs: 2
+  connect_timeout_secs: 30
+  idle_timeout_secs: 300
 health_check:
   enabled: true
   interval_secs: 10

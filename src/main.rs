@@ -136,6 +136,7 @@ async fn run_health_check_task(
             Ok(Ok(_stream)) => {
                 // Connection successful
                 state.update_health_status(true, Some(latency), None).await;
+                metrics::record_health_check(true, Some(latency));
                 tracing::debug!(
                     "Health check passed: upstream {}:{} ({}ms)",
                     upstream_host,
@@ -149,6 +150,7 @@ async fn run_health_check_task(
                 state
                     .update_health_status(false, None, Some(error.clone()))
                     .await;
+                metrics::record_health_check(false, None);
                 warn!(
                     "Health check failed: upstream {}:{} - {}",
                     upstream_host, upstream_port, error
@@ -160,6 +162,8 @@ async fn run_health_check_task(
                 state
                     .update_health_status(false, None, Some(error.clone()))
                     .await;
+                metrics::record_health_check(false, None);
+                metrics::record_upstream_timeout();
                 warn!(
                     "Health check timeout: upstream {}:{} - {}",
                     upstream_host, upstream_port, error
@@ -169,6 +173,46 @@ async fn run_health_check_task(
 
         tokio::time::sleep(interval).await;
     }
+}
+
+fn update_upstream_pool_metrics(pool: &Semaphore, max_size: usize) {
+    let active = max_size.saturating_sub(pool.available_permits());
+    metrics::set_upstream_pool_state(active, max_size);
+}
+
+fn build_postgres_fatal_error_packet(sqlstate: &str, message: &str) -> Vec<u8> {
+    fn push_field(payload: &mut Vec<u8>, key: u8, value: &str) {
+        payload.push(key);
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(0);
+    }
+
+    let mut payload = Vec::new();
+    push_field(&mut payload, b'S', "FATAL");
+    push_field(&mut payload, b'V', "FATAL");
+    push_field(&mut payload, b'C', sqlstate);
+    push_field(&mut payload, b'M', message);
+    payload.push(0);
+
+    let mut packet = Vec::with_capacity(1 + 4 + payload.len());
+    packet.push(b'E');
+    packet.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+    packet.extend_from_slice(&payload);
+    packet
+}
+
+async fn send_postgres_fatal_error_response<S>(
+    client_socket: &mut S,
+    sqlstate: &str,
+    message: &str,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let packet = build_postgres_fatal_error_packet(sqlstate, message);
+    client_socket.write_all(&packet).await?;
+    client_socket.flush().await?;
+    Ok(())
 }
 
 /// Background task that watches the config file for changes and reloads
@@ -372,6 +416,15 @@ async fn main() -> Result<()> {
         Arc::new(Semaphore::new(max))
     });
 
+    // Upstream pool guardrails
+    let upstream_pool_size = config.limits.as_ref().and_then(|l| l.upstream_pool_size);
+    let upstream_pool = upstream_pool_size.map(|size| {
+        info!("Upstream pool size set to {}", size);
+        let pool = Arc::new(Semaphore::new(size));
+        update_upstream_pool_metrics(&pool, size);
+        pool
+    });
+
     // Rate limiting state
     let rate_limit = config
         .limits
@@ -401,6 +454,7 @@ async fn main() -> Result<()> {
 
                     if rate_limit_tokens == 0 {
                         warn!("Rate limit exceeded, rejecting connection from {}", client_addr);
+                        metrics::record_connection_rejected("rate_limit");
                         drop(client_socket);
                         continue;
                     }
@@ -413,6 +467,7 @@ async fn main() -> Result<()> {
                         Ok(permit) => Some(permit),
                         Err(_) => {
                             warn!("Connection limit reached, rejecting connection from {}", client_addr);
+                            metrics::record_connection_rejected("max_connections");
                             drop(client_socket);
                             continue;
                         }
@@ -427,10 +482,13 @@ async fn main() -> Result<()> {
                 let upstream_port = args.upstream_port;
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
+                let upstream_pool = upstream_pool.clone();
+                let configured_upstream_pool_size = upstream_pool_size;
 
                 tokio::spawn(async move {
                     // Hold the permit for the duration of the connection
-                    let _permit = permit;
+                    let _inbound_permit = permit;
+                    let client_socket = client_socket;
 
                     let span = info_span!(
                         "connection",
@@ -441,7 +499,53 @@ async fn main() -> Result<()> {
                     );
 
                     async {
+                        let mut upstream_pool_permit = None;
+                        if matches!(protocol, DbProtocol::Mysql)
+                            && let (Some(pool), Some(pool_size)) =
+                                (upstream_pool.clone(), configured_upstream_pool_size)
+                        {
+                            let wait_timeout = {
+                                let config = state.config.read().await;
+                                let limits = config.limits.as_ref();
+                                Duration::from_secs(
+                                    limits.map(|l| l.upstream_pool_wait_timeout_secs).unwrap_or(5),
+                                )
+                            };
+                            let wait_started = Instant::now();
+                            match tokio::time::timeout(wait_timeout, pool.clone().acquire_owned())
+                                .await
+                            {
+                                Ok(Ok(permit)) => {
+                                    metrics::record_upstream_pool_wait(
+                                        wait_started.elapsed().as_secs_f64(),
+                                    );
+                                    update_upstream_pool_metrics(&pool, pool_size);
+                                    upstream_pool_permit = Some((pool, permit, pool_size));
+                                }
+                                Ok(Err(_)) => {
+                                    warn!(
+                                        "Upstream pool closed while acquiring slot for {}",
+                                        client_addr
+                                    );
+                                    metrics::record_connection_rejected("upstream_pool_closed");
+                                    return;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        "Timed out waiting for upstream pool slot after {:?} for {}",
+                                        wait_timeout, client_addr
+                                    );
+                                    metrics::record_upstream_pool_acquire_timeout();
+                                    metrics::record_connection_rejected(
+                                        "upstream_pool_wait_timeout",
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+
                         state.active_connections.fetch_add(1, Ordering::Relaxed);
+                        metrics::record_connection_opened();
                         state.record_connection().await;
                         let result = match protocol {
                             DbProtocol::Postgres => {
@@ -451,6 +555,8 @@ async fn main() -> Result<()> {
                                     upstream_port,
                                     state.clone(),
                                     tls_acceptor,
+                                    upstream_pool.clone(),
+                                    configured_upstream_pool_size,
                                 )
                                 .await
                             }
@@ -465,6 +571,12 @@ async fn main() -> Result<()> {
                             }
                         };
                         state.active_connections.fetch_sub(1, Ordering::Relaxed);
+                        metrics::record_connection_closed();
+
+                        if let Some((pool, permit, pool_size)) = upstream_pool_permit {
+                            drop(permit);
+                            update_upstream_pool_metrics(&pool, pool_size);
+                        }
 
                         if let Err(e) = result {
                             tracing::error!(error = %e, "Connection error");
@@ -522,6 +634,8 @@ async fn process_postgres_connection(
     upstream_port: u16,
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
+    upstream_pool: Option<Arc<Semaphore>>,
+    upstream_pool_size: Option<usize>,
 ) -> Result<()> {
     let mut buffer = [0u8; 8];
     let n = client_socket.peek(&mut buffer).await?;
@@ -547,8 +661,15 @@ async fn process_postgres_connection(
                 client_socket.write_all(b"S").await?;
 
                 let tls_stream = acceptor.accept(client_socket).await?;
-                return handle_postgres_protocol(tls_stream, upstream_host, upstream_port, state)
-                    .await;
+                return handle_postgres_protocol(
+                    tls_stream,
+                    upstream_host,
+                    upstream_port,
+                    state,
+                    upstream_pool,
+                    upstream_pool_size,
+                )
+                .await;
             } else {
                 info!("Received SSLRequest, denying (TLS not configured)...");
                 client_socket.write_all(b"N").await?;
@@ -556,7 +677,15 @@ async fn process_postgres_connection(
         }
     }
 
-    handle_postgres_protocol(client_socket, upstream_host, upstream_port, state).await
+    handle_postgres_protocol(
+        client_socket,
+        upstream_host,
+        upstream_port,
+        state,
+        upstream_pool,
+        upstream_pool_size,
+    )
+    .await
 }
 
 /// Creates a TLS ClientConfig that uses the OS native certificate verifier.
@@ -578,27 +707,79 @@ async fn handle_postgres_protocol<S>(
     upstream_host: String,
     upstream_port: u16,
     state: AppState,
+    upstream_pool: Option<Arc<Semaphore>>,
+    upstream_pool_size: Option<usize>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let mut client_socket = client_socket;
+
     // Get timeout configuration
-    let (connect_timeout, idle_timeout) = {
+    let (connect_timeout, idle_timeout, pool_wait_timeout) = {
         let config = state.config.read().await;
         let limits = config.limits.as_ref();
         (
             Duration::from_secs(limits.map(|l| l.connect_timeout_secs).unwrap_or(30)),
             Duration::from_secs(limits.map(|l| l.idle_timeout_secs).unwrap_or(300)),
+            Duration::from_secs(
+                limits
+                    .map(|l| l.upstream_pool_wait_timeout_secs)
+                    .unwrap_or(5),
+            ),
         )
     };
 
+    let mut upstream_pool_permit = None;
+    if let (Some(pool), Some(pool_size)) = (upstream_pool, upstream_pool_size) {
+        let wait_started = Instant::now();
+        match tokio::time::timeout(pool_wait_timeout, pool.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                metrics::record_upstream_pool_wait(wait_started.elapsed().as_secs_f64());
+                update_upstream_pool_metrics(&pool, pool_size);
+                upstream_pool_permit = Some((pool, permit, pool_size));
+            }
+            Ok(Err(_)) => {
+                metrics::record_connection_rejected("upstream_pool_closed");
+                let _ = send_postgres_fatal_error_response(
+                    &mut client_socket,
+                    "08006",
+                    "upstream pool unavailable",
+                )
+                .await;
+                return Ok(());
+            }
+            Err(_) => {
+                metrics::record_upstream_pool_acquire_timeout();
+                metrics::record_connection_rejected("upstream_pool_wait_timeout");
+                let message = format!(
+                    "upstream pool is at capacity; timed out after {}s waiting for an available slot",
+                    pool_wait_timeout.as_secs()
+                );
+                let _ =
+                    send_postgres_fatal_error_response(&mut client_socket, "53300", &message).await;
+                return Ok(());
+            }
+        }
+    }
+
     // Create upstream connection with timeout
-    let mut upstream_socket = tokio::time::timeout(
+    let mut upstream_socket = match tokio::time::timeout(
         connect_timeout,
         tokio::net::TcpStream::connect(format!("{}:{}", upstream_host, upstream_port)),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Upstream connection timeout after {:?}", connect_timeout))??;
+    {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => {
+            metrics::record_upstream_timeout();
+            return Err(anyhow::anyhow!(
+                "Upstream connection timeout after {:?}",
+                connect_timeout
+            ));
+        }
+    };
 
     // Check if upstream TLS is enabled
     let upstream_tls_enabled = {
@@ -636,13 +817,18 @@ where
             let upstream_tls_stream = connector.connect(domain, upstream_socket).await?;
 
             // 4. Continue with TLS stream
-            return handle_postgres_protocol_inner(
+            let result = handle_postgres_protocol_inner(
                 client_socket,
                 upstream_tls_stream,
                 state,
                 idle_timeout,
             )
             .await;
+            if let Some((pool, permit, pool_size)) = upstream_pool_permit {
+                drop(permit);
+                update_upstream_pool_metrics(&pool, pool_size);
+            }
+            return result;
         } else {
             tracing::warn!(
                 "Upstream denied SSLRequest. Falling back to cleartext (or aborting if strict)."
@@ -652,7 +838,13 @@ where
     }
 
     // Cleartext connection
-    handle_postgres_protocol_inner(client_socket, upstream_socket, state, idle_timeout).await
+    let result =
+        handle_postgres_protocol_inner(client_socket, upstream_socket, state, idle_timeout).await;
+    if let Some((pool, permit, pool_size)) = upstream_pool_permit {
+        drop(permit);
+        update_upstream_pool_metrics(&pool, pool_size);
+    }
+    result
 }
 
 async fn handle_postgres_protocol_inner<S, U>(
@@ -778,6 +970,7 @@ where
             // Idle timeout
             _ = tokio::time::sleep(idle_timeout) => {
                 info!("Connection idle timeout after {:?}", idle_timeout);
+                metrics::record_idle_timeout();
                 return Ok(());
             }
         }
@@ -864,12 +1057,22 @@ async fn process_mysql_connection(
     };
 
     // Connect to upstream MySQL server with timeout
-    let upstream_socket = tokio::time::timeout(
+    let upstream_socket = match tokio::time::timeout(
         connect_timeout,
         tokio::net::TcpStream::connect(format!("{}:{}", upstream_host, upstream_port)),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Upstream connection timeout after {:?}", connect_timeout))??;
+    {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(err)) => return Err(err.into()),
+        Err(_) => {
+            metrics::record_upstream_timeout();
+            return Err(anyhow::anyhow!(
+                "Upstream connection timeout after {:?}",
+                connect_timeout
+            ));
+        }
+    };
 
     handle_mysql_protocol(client_socket, upstream_socket, state, idle_timeout).await
 }
@@ -1025,6 +1228,7 @@ where
             // Idle timeout
             _ = tokio::time::sleep(idle_timeout) => {
                 info!("MySQL connection idle timeout after {:?}", idle_timeout);
+                metrics::record_idle_timeout();
                 return Ok(());
             }
         }
@@ -1044,4 +1248,29 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
     let key = rustls_pemfile::private_key(&mut reader)?
         .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_postgres_fatal_error_packet;
+
+    #[test]
+    fn test_build_postgres_fatal_error_packet_format() {
+        let packet = build_postgres_fatal_error_packet("53300", "pool timeout");
+
+        assert_eq!(packet[0], b'E');
+        let length = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]) as usize;
+        assert_eq!(length, packet.len() - 1);
+
+        let payload = &packet[5..];
+        assert_eq!(payload[0], b'S');
+        assert!(payload.ends_with(&[0]));
+        assert!(payload.windows("FATAL\0".len()).any(|w| w == b"FATAL\0"));
+        assert!(payload.windows("53300\0".len()).any(|w| w == b"53300\0"));
+        assert!(
+            payload
+                .windows("pool timeout\0".len())
+                .any(|w| w == b"pool timeout\0")
+        );
+    }
 }

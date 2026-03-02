@@ -40,6 +40,14 @@ pub struct LimitsConfig {
     /// Idle timeout in seconds - close connection after no activity (default: 300)
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+
+    /// Maximum concurrent upstream sessions (default: unlimited)
+    #[serde(default)]
+    pub upstream_pool_size: Option<usize>,
+
+    /// Max time to wait for an upstream slot before rejecting (default: 5)
+    #[serde(default = "default_upstream_pool_wait_timeout")]
+    pub upstream_pool_wait_timeout_secs: u64,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -48,6 +56,10 @@ fn default_connect_timeout() -> u64 {
 
 fn default_idle_timeout() -> u64 {
     300 // 5 minutes
+}
+
+fn default_upstream_pool_wait_timeout() -> u64 {
+    5
 }
 
 /// Health check configuration for upstream database
@@ -333,5 +345,35 @@ masking_enabled: true
 "#;
         let result: Result<AppConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err()); // Should fail because 'rules' is missing
+    }
+
+    #[test]
+    fn test_limits_defaults_include_upstream_pool_settings() {
+        let yaml = r#"
+rules: []
+limits: {}
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let limits = config.limits.expect("limits should be present");
+
+        assert_eq!(limits.connect_timeout_secs, 30);
+        assert_eq!(limits.idle_timeout_secs, 300);
+        assert_eq!(limits.upstream_pool_wait_timeout_secs, 5);
+        assert_eq!(limits.upstream_pool_size, None);
+    }
+
+    #[test]
+    fn test_limits_parses_upstream_pool_settings() {
+        let yaml = r#"
+rules: []
+limits:
+  upstream_pool_size: 50
+  upstream_pool_wait_timeout_secs: 12
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let limits = config.limits.expect("limits should be present");
+
+        assert_eq!(limits.upstream_pool_size, Some(50));
+        assert_eq!(limits.upstream_pool_wait_timeout_secs, 12);
     }
 }
