@@ -183,14 +183,41 @@ impl Decoder for PostgresCodec {
                 }
                 b'D' => {
                     // DataRow
+                    if data.remaining() < 2 {
+                        return Err(anyhow::anyhow!("Malformed DataRow: missing column count"));
+                    }
                     let num_cols = data.get_u16();
                     let mut values = Vec::with_capacity(num_cols as usize);
-                    for _ in 0..num_cols {
+                    for col_idx in 0..num_cols {
+                        if data.remaining() < 4 {
+                            return Err(anyhow::anyhow!(
+                                "Malformed DataRow: missing length for column {}",
+                                col_idx
+                            ));
+                        }
                         let len = data.get_i32();
                         if len == -1 {
                             values.push(None);
                         } else {
-                            let val = data.split_to(len as usize);
+                            if len < 0 {
+                                return Err(anyhow::anyhow!(
+                                    "Malformed DataRow: invalid negative length {} for column {}",
+                                    len,
+                                    col_idx
+                                ));
+                            }
+
+                            let len = len as usize;
+                            if data.remaining() < len {
+                                return Err(anyhow::anyhow!(
+                                    "Malformed DataRow: column {} length {} exceeds remaining payload {}",
+                                    col_idx,
+                                    len,
+                                    data.remaining()
+                                ));
+                            }
+
+                            let val = data.split_to(len);
                             values.push(Some(val));
                         }
                     }
@@ -357,6 +384,7 @@ fn read_cstring(buf: &mut BytesMut) -> Result<String> {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn test_decode_startup_message() {
@@ -667,5 +695,55 @@ mod tests {
         } else {
             panic!("Expected DataRow");
         }
+    }
+
+    #[test]
+    fn test_decode_data_row_rejects_negative_non_null_length_without_panicking() {
+        let mut codec = PostgresCodec::new();
+        codec.is_startup = false;
+        let mut buf = BytesMut::new();
+
+        // DataRow with one column and invalid negative length (only -1 is valid NULL marker)
+        let total_len = 4 + 2 + 4;
+        buf.put_u8(b'D');
+        buf.put_u32(total_len as u32);
+        buf.put_u16(1);
+        buf.put_i32(-2);
+
+        let result = catch_unwind(AssertUnwindSafe(|| codec.decode(&mut buf)));
+        assert!(
+            result.is_ok(),
+            "decoder should not panic on malformed lengths"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "decoder should return an error for invalid negative lengths"
+        );
+    }
+
+    #[test]
+    fn test_decode_data_row_rejects_declared_length_larger_than_payload() {
+        let mut codec = PostgresCodec::new();
+        codec.is_startup = false;
+        let mut buf = BytesMut::new();
+
+        // Declares 10-byte field but provides only 3 bytes.
+        let payload = b"abc";
+        let total_len = 4 + 2 + 4 + payload.len();
+        buf.put_u8(b'D');
+        buf.put_u32(total_len as u32);
+        buf.put_u16(1);
+        buf.put_i32(10);
+        buf.put_slice(payload);
+
+        let result = catch_unwind(AssertUnwindSafe(|| codec.decode(&mut buf)));
+        assert!(
+            result.is_ok(),
+            "decoder should not panic on malformed lengths"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "decoder should return an error when column length exceeds remaining payload"
+        );
     }
 }
