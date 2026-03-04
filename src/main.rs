@@ -180,6 +180,39 @@ fn update_upstream_pool_metrics(pool: &Semaphore, max_size: usize) {
     metrics::set_upstream_pool_state(active, max_size);
 }
 
+fn resolve_timeout_limits(
+    limits: Option<&crate::config::LimitsConfig>,
+) -> (Duration, Duration, Duration) {
+    (
+        Duration::from_secs(limits.map_or(30, |l| l.connect_timeout_secs)),
+        Duration::from_secs(limits.map_or(300, |l| l.idle_timeout_secs)),
+        Duration::from_secs(limits.map_or(5, |l| l.upstream_pool_wait_timeout_secs)),
+    )
+}
+
+async fn connect_upstream_with_timeout(
+    upstream_host: &str,
+    upstream_port: u16,
+    connect_timeout: Duration,
+) -> Result<tokio::net::TcpStream> {
+    match tokio::time::timeout(
+        connect_timeout,
+        tokio::net::TcpStream::connect(format!("{upstream_host}:{upstream_port}")),
+    )
+    .await
+    {
+        Ok(Ok(socket)) => Ok(socket),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => {
+            metrics::record_upstream_timeout();
+            Err(anyhow::anyhow!(
+                "Upstream connection timeout after {:?}",
+                connect_timeout
+            ))
+        }
+    }
+}
+
 fn build_postgres_fatal_error_packet(sqlstate: &str, message: &str) -> Vec<u8> {
     fn push_field(payload: &mut Vec<u8>, key: u8, value: &str) {
         payload.push(key);
@@ -201,6 +234,30 @@ fn build_postgres_fatal_error_packet(sqlstate: &str, message: &str) -> Vec<u8> {
     packet
 }
 
+fn build_mysql_err_packet(error_code: u16, sql_state: &str, message: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 2 + 1 + 5 + message.len());
+    payload.push(0xFF);
+    payload.extend_from_slice(&error_code.to_le_bytes());
+    payload.push(b'#');
+
+    let mut state = *b"HY000";
+    let provided = sql_state.as_bytes();
+    if provided.len() == 5 {
+        state.copy_from_slice(provided);
+    }
+    payload.extend_from_slice(&state);
+    payload.extend_from_slice(message.as_bytes());
+
+    let len = payload.len();
+    let mut packet = Vec::with_capacity(4 + len);
+    packet.push((len & 0xFF) as u8);
+    packet.push(((len >> 8) & 0xFF) as u8);
+    packet.push(((len >> 16) & 0xFF) as u8);
+    packet.push(0); // sequence id
+    packet.extend_from_slice(&payload);
+    packet
+}
+
 async fn send_postgres_fatal_error_response<S>(
     client_socket: &mut S,
     sqlstate: &str,
@@ -210,6 +267,21 @@ where
     S: tokio::io::AsyncWrite + Unpin,
 {
     let packet = build_postgres_fatal_error_packet(sqlstate, message);
+    client_socket.write_all(&packet).await?;
+    client_socket.flush().await?;
+    Ok(())
+}
+
+async fn send_mysql_err_response<S>(
+    client_socket: &mut S,
+    error_code: u16,
+    sql_state: &str,
+    message: &str,
+) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let packet = build_mysql_err_packet(error_code, sql_state, message);
     client_socket.write_all(&packet).await?;
     client_socket.flush().await?;
     Ok(())
@@ -488,7 +560,7 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     // Hold the permit for the duration of the connection
                     let _inbound_permit = permit;
-                    let client_socket = client_socket;
+                    let mut client_socket = client_socket;
 
                     let span = info_span!(
                         "connection",
@@ -506,10 +578,9 @@ async fn main() -> Result<()> {
                         {
                             let wait_timeout = {
                                 let config = state.config.read().await;
-                                let limits = config.limits.as_ref();
-                                Duration::from_secs(
-                                    limits.map(|l| l.upstream_pool_wait_timeout_secs).unwrap_or(5),
-                                )
+                                let (_, _, pool_wait_timeout) =
+                                    resolve_timeout_limits(config.limits.as_ref());
+                                pool_wait_timeout
                             };
                             let wait_started = Instant::now();
                             match tokio::time::timeout(wait_timeout, pool.clone().acquire_owned())
@@ -528,6 +599,13 @@ async fn main() -> Result<()> {
                                         client_addr
                                     );
                                     metrics::record_connection_rejected("upstream_pool_closed");
+                                    let _ = send_mysql_err_response(
+                                        &mut client_socket,
+                                        1040,
+                                        "08004",
+                                        "upstream pool unavailable",
+                                    )
+                                    .await;
                                     return;
                                 }
                                 Err(_) => {
@@ -539,6 +617,17 @@ async fn main() -> Result<()> {
                                     metrics::record_connection_rejected(
                                         "upstream_pool_wait_timeout",
                                     );
+                                    let message = format!(
+                                        "upstream pool is at capacity; timed out after {}s waiting for an available slot",
+                                        wait_timeout.as_secs()
+                                    );
+                                    let _ = send_mysql_err_response(
+                                        &mut client_socket,
+                                        1040,
+                                        "08004",
+                                        &message,
+                                    )
+                                    .await;
                                     return;
                                 }
                             }
@@ -718,16 +807,7 @@ where
     // Get timeout configuration
     let (connect_timeout, idle_timeout, pool_wait_timeout) = {
         let config = state.config.read().await;
-        let limits = config.limits.as_ref();
-        (
-            Duration::from_secs(limits.map(|l| l.connect_timeout_secs).unwrap_or(30)),
-            Duration::from_secs(limits.map(|l| l.idle_timeout_secs).unwrap_or(300)),
-            Duration::from_secs(
-                limits
-                    .map(|l| l.upstream_pool_wait_timeout_secs)
-                    .unwrap_or(5),
-            ),
-        )
+        resolve_timeout_limits(config.limits.as_ref())
     };
 
     let mut upstream_pool_permit = None;
@@ -764,22 +844,8 @@ where
     }
 
     // Create upstream connection with timeout
-    let mut upstream_socket = match tokio::time::timeout(
-        connect_timeout,
-        tokio::net::TcpStream::connect(format!("{}:{}", upstream_host, upstream_port)),
-    )
-    .await
-    {
-        Ok(Ok(socket)) => socket,
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => {
-            metrics::record_upstream_timeout();
-            return Err(anyhow::anyhow!(
-                "Upstream connection timeout after {:?}",
-                connect_timeout
-            ));
-        }
-    };
+    let mut upstream_socket =
+        connect_upstream_with_timeout(&upstream_host, upstream_port, connect_timeout).await?;
 
     // Check if upstream TLS is enabled
     let upstream_tls_enabled = {
@@ -1049,30 +1115,13 @@ async fn process_mysql_connection(
     // Get timeout configuration
     let (connect_timeout, idle_timeout) = {
         let config = state.config.read().await;
-        let limits = config.limits.as_ref();
-        (
-            Duration::from_secs(limits.map(|l| l.connect_timeout_secs).unwrap_or(30)),
-            Duration::from_secs(limits.map(|l| l.idle_timeout_secs).unwrap_or(300)),
-        )
+        let (connect_timeout, idle_timeout, _) = resolve_timeout_limits(config.limits.as_ref());
+        (connect_timeout, idle_timeout)
     };
 
     // Connect to upstream MySQL server with timeout
-    let upstream_socket = match tokio::time::timeout(
-        connect_timeout,
-        tokio::net::TcpStream::connect(format!("{}:{}", upstream_host, upstream_port)),
-    )
-    .await
-    {
-        Ok(Ok(socket)) => socket,
-        Ok(Err(err)) => return Err(err.into()),
-        Err(_) => {
-            metrics::record_upstream_timeout();
-            return Err(anyhow::anyhow!(
-                "Upstream connection timeout after {:?}",
-                connect_timeout
-            ));
-        }
-    };
+    let upstream_socket =
+        connect_upstream_with_timeout(&upstream_host, upstream_port, connect_timeout).await?;
 
     handle_mysql_protocol(client_socket, upstream_socket, state, idle_timeout).await
 }
@@ -1252,7 +1301,11 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_postgres_fatal_error_packet;
+    use super::{
+        build_mysql_err_packet, build_postgres_fatal_error_packet, resolve_timeout_limits,
+    };
+    use crate::config::LimitsConfig;
+    use std::time::Duration;
 
     #[test]
     fn test_build_postgres_fatal_error_packet_format() {
@@ -1272,5 +1325,47 @@ mod tests {
                 .windows("pool timeout\0".len())
                 .any(|w| w == b"pool timeout\0")
         );
+    }
+
+    #[test]
+    fn test_build_mysql_err_packet_format() {
+        let packet = build_mysql_err_packet(1040, "08004", "upstream pool timeout");
+
+        // Packet header: 3-byte payload length + 1-byte sequence
+        let payload_len =
+            (packet[0] as usize) | ((packet[1] as usize) << 8) | ((packet[2] as usize) << 16);
+        assert_eq!(payload_len, packet.len() - 4);
+        assert_eq!(packet[3], 0);
+
+        let payload = &packet[4..];
+        assert_eq!(payload[0], 0xFF);
+        assert_eq!(u16::from_le_bytes([payload[1], payload[2]]), 1040);
+        assert_eq!(payload[3], b'#');
+        assert_eq!(&payload[4..9], b"08004");
+        assert_eq!(&payload[9..], b"upstream pool timeout");
+    }
+
+    #[test]
+    fn test_resolve_timeout_limits_defaults() {
+        let (connect, idle, pool_wait) = resolve_timeout_limits(None);
+        assert_eq!(connect, Duration::from_secs(30));
+        assert_eq!(idle, Duration::from_secs(300));
+        assert_eq!(pool_wait, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_resolve_timeout_limits_from_config() {
+        let limits = LimitsConfig {
+            max_connections: None,
+            connections_per_second: None,
+            connect_timeout_secs: 12,
+            idle_timeout_secs: 34,
+            upstream_pool_size: Some(10),
+            upstream_pool_wait_timeout_secs: 7,
+        };
+        let (connect, idle, pool_wait) = resolve_timeout_limits(Some(&limits));
+        assert_eq!(connect, Duration::from_secs(12));
+        assert_eq!(idle, Duration::from_secs(34));
+        assert_eq!(pool_wait, Duration::from_secs(7));
     }
 }
