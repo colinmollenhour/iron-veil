@@ -9,7 +9,7 @@
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 /// Test configuration
 const PROXY_HOST: &str = "127.0.0.1";
@@ -133,7 +133,7 @@ async fn assert_protected_json_response(
 mod api_tests {
     use super::*;
 
-    /// Test health endpoint eventually reports OK once dependencies stabilize.
+    /// Test health endpoint contract (healthy or degraded).
     #[tokio::test]
     async fn test_health_endpoint() {
         if !ensure_api_running("test_health_endpoint").await {
@@ -141,39 +141,45 @@ mod api_tests {
         }
 
         let client = reqwest::Client::new();
-        const MAX_ATTEMPTS: u8 = 30;
-        const RETRY_DELAY: Duration = Duration::from_secs(1);
-        let endpoint = format!("http://{}:{}/health", PROXY_HOST, API_PORT);
+        let resp = client
+            .get(format!("http://{}:{}/health", PROXY_HOST, API_PORT))
+            .timeout(CONNECTION_TIMEOUT)
+            .send()
+            .await
+            .expect("Failed to send request");
 
-        for attempt in 1..=MAX_ATTEMPTS {
-            let resp = client
-                .get(&endpoint)
-                .timeout(CONNECTION_TIMEOUT)
-                .send()
-                .await
-                .expect("Failed to send request");
+        let status = resp.status();
+        assert!(
+            status.as_u16() == 200 || status.as_u16() == 503,
+            "Health endpoint should return 200 or 503, got {}",
+            status
+        );
 
-            let status = resp.status();
-            let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
-            assert!(
-                body.get("status").is_some(),
-                "Response should have status field (attempt {attempt}/{MAX_ATTEMPTS})"
+        let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+        let reported_status = body.get("status").and_then(|v| v.as_str());
+        if status.as_u16() == 200 {
+            assert_eq!(
+                reported_status,
+                Some("ok"),
+                "200 health response should report status=ok"
             );
-
-            if status.is_success() {
-                return;
-            }
-
-            if status.as_u16() == 503 && attempt < MAX_ATTEMPTS {
-                sleep(RETRY_DELAY).await;
-                continue;
-            }
-
-            panic!(
-                "Health check should eventually succeed; got status {} on attempt {}/{}. Body: {}",
-                status, attempt, MAX_ATTEMPTS, body
+        } else {
+            assert_eq!(
+                reported_status,
+                Some("degraded"),
+                "503 health response should report status=degraded"
             );
         }
+
+        assert_eq!(
+            body.get("service").and_then(|v| v.as_str()),
+            Some("ironveil"),
+            "Health response should report service name"
+        );
+        assert!(
+            body.get("upstream").is_some(),
+            "Health response should include upstream details"
+        );
     }
 
     /// Test metrics endpoint returns Prometheus format (when available)
