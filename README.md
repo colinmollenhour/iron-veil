@@ -307,13 +307,13 @@ iron-veil/
 │       ├── postgres.rs  # PostgreSQL wire protocol codec
 │       └── mysql.rs     # MySQL wire protocol codec
 ├── tests/
-│   └── integration_test.rs  # Integration tests (17 tests)
+│   └── integration_test.rs  # Integration tests (20 tests)
 ├── monitoring/
 │   └── grafana/
 │       └── ironveil-dashboard.json  # Baseline Grafana dashboard
 ├── web/                 # Next.js dashboard
 ├── proxy.yaml           # Configuration file
-└── docker-compose.yml   # Full stack deployment
+└── docker-compose.yml   # Backend stack (proxy + postgres)
 ```
 
 ## Monitoring
@@ -326,7 +326,7 @@ Metrics are exposed at `http://localhost:3001/metrics`:
 # Connection metrics
 ironveil_connections_total
 ironveil_connections_active
-ironveil_connections_rejected_total{reason="rate_limit|max_connections"}
+ironveil_connections_rejected_total{reason="rate_limit|max_connections|upstream_pool_closed|upstream_pool_wait_timeout"}
 
 # Query metrics
 ironveil_queries_total{protocol="postgres|mysql"}
@@ -408,6 +408,12 @@ Run the dashboard separately when needed:
 cd web
 npm install
 npm run dev
+```
+
+Run integration tests in strict mode (fail if required services are not running):
+
+```bash
+IRONVEIL_REQUIRE_SERVICES=1 cargo test --test integration_test
 ```
 
 ## Testing OpenTelemetry

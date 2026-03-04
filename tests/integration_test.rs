@@ -2,7 +2,7 @@
 //!
 //! These tests require running database containers. To run:
 //! ```bash
-//! docker-compose up -d postgres
+//! docker compose up -d
 //! cargo test --test integration_test
 //! ```
 
@@ -16,6 +16,65 @@ const PROXY_HOST: &str = "127.0.0.1";
 const PROXY_PORT: u16 = 6543;
 const API_PORT: u16 = 3001;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[test]
+fn test_strict_service_mode_defaults_to_non_strict() {
+    assert!(!strict_service_mode(None, None));
+}
+
+#[test]
+fn test_strict_service_mode_enabled_by_ci() {
+    assert!(strict_service_mode(Some("true"), None));
+}
+
+#[test]
+fn test_strict_service_mode_enabled_by_explicit_flag() {
+    assert!(strict_service_mode(None, Some("1")));
+}
+
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn strict_service_mode(ci: Option<&str>, explicit: Option<&str>) -> bool {
+    env_flag_enabled(ci) || env_flag_enabled(explicit)
+}
+
+fn should_require_services() -> bool {
+    let ci = std::env::var("CI").ok();
+    let explicit = std::env::var("IRONVEIL_REQUIRE_SERVICES").ok();
+    strict_service_mode(ci.as_deref(), explicit.as_deref())
+}
+
+async fn ensure_api_running(test_name: &str) -> bool {
+    if is_api_running().await {
+        return true;
+    }
+
+    let message = format!("API not running on port {}", API_PORT);
+    if should_require_services() {
+        panic!("{test_name}: {message}. Start required services before running integration tests.");
+    }
+
+    eprintln!("Skipping test: {test_name} ({message})");
+    false
+}
+
+async fn ensure_proxy_running(test_name: &str) -> bool {
+    if is_proxy_running().await {
+        return true;
+    }
+
+    let message = format!("Proxy not running on port {}", PROXY_PORT);
+    if should_require_services() {
+        panic!("{test_name}: {message}. Start required services before running integration tests.");
+    }
+
+    eprintln!("Skipping test: {test_name} ({message})");
+    false
+}
 
 /// Helper to check if the proxy is running
 async fn is_proxy_running() -> bool {
@@ -77,8 +136,7 @@ mod api_tests {
     /// Test health endpoint returns OK
     #[tokio::test]
     async fn test_health_endpoint() {
-        if !is_api_running().await {
-            eprintln!("Skipping test: API not running on port {}", API_PORT);
+        if !ensure_api_running("test_health_endpoint").await {
             return;
         }
 
@@ -99,8 +157,7 @@ mod api_tests {
     /// Test metrics endpoint returns Prometheus format (when available)
     #[tokio::test]
     async fn test_metrics_endpoint() {
-        if !is_api_running().await {
-            eprintln!("Skipping test: API not running on port {}", API_PORT);
+        if !ensure_api_running("test_metrics_endpoint").await {
             return;
         }
 
@@ -139,8 +196,7 @@ mod api_tests {
     /// Test rules endpoint - verifies it responds (auth behavior depends on config)
     #[tokio::test]
     async fn test_rules_endpoint_responds() {
-        if !is_api_running().await {
-            eprintln!("Skipping test: API not running on port {}", API_PORT);
+        if !ensure_api_running("test_rules_endpoint_responds").await {
             return;
         }
 
@@ -158,8 +214,7 @@ mod api_tests {
     /// Test rules endpoint with API key
     #[tokio::test]
     async fn test_rules_with_api_key() {
-        if !is_api_running().await {
-            eprintln!("Skipping test: API not running on port {}", API_PORT);
+        if !ensure_api_running("test_rules_with_api_key").await {
             return;
         }
 
@@ -178,8 +233,7 @@ mod api_tests {
     /// Test config endpoint
     #[tokio::test]
     async fn test_config_endpoint() {
-        if !is_api_running().await {
-            eprintln!("Skipping test: API not running on port {}", API_PORT);
+        if !ensure_api_running("test_config_endpoint").await {
             return;
         }
 
@@ -198,8 +252,7 @@ mod api_tests {
     /// Test connections endpoint
     #[tokio::test]
     async fn test_connections_endpoint() {
-        if !is_api_running().await {
-            eprintln!("Skipping test: API not running on port {}", API_PORT);
+        if !ensure_api_running("test_connections_endpoint").await {
             return;
         }
 
@@ -241,8 +294,7 @@ mod postgres_tests {
     /// Test basic PostgreSQL proxy connection
     #[tokio::test]
     async fn test_postgres_connection() {
-        if !is_proxy_running().await {
-            eprintln!("Skipping test: Proxy not running on port {}", PROXY_PORT);
+        if !ensure_proxy_running("test_postgres_connection").await {
             return;
         }
 
@@ -298,8 +350,7 @@ mod postgres_tests {
     /// Test SSL request handling
     #[tokio::test]
     async fn test_postgres_ssl_request() {
-        if !is_proxy_running().await {
-            eprintln!("Skipping test: Proxy not running on port {}", PROXY_PORT);
+        if !ensure_proxy_running("test_postgres_ssl_request").await {
             return;
         }
 
@@ -397,6 +448,12 @@ mod mysql_tests {
     #[tokio::test]
     async fn test_mysql_connection() {
         if !is_mysql_proxy_running().await {
+            if should_require_services() {
+                panic!(
+                    "test_mysql_connection: MySQL proxy not running on port {}. Start required services before running integration tests.",
+                    MYSQL_PROXY_PORT
+                );
+            }
             eprintln!(
                 "Skipping test: MySQL proxy not running on port {}",
                 MYSQL_PROXY_PORT
@@ -610,40 +667,5 @@ mod protocol_tests {
             (packet[0] as u32) | ((packet[1] as u32) << 8) | ((packet[2] as u32) << 16);
         assert_eq!(parsed_length, 8);
         assert_eq!(packet[3], 0); // sequence
-    }
-}
-
-/// Test utilities for generating test data
-#[allow(dead_code)]
-mod test_utils {
-    /// Generate a sample email for testing
-    pub fn sample_email() -> &'static str {
-        "john.doe@example.com"
-    }
-
-    /// Generate a sample credit card for testing
-    pub fn sample_credit_card() -> &'static str {
-        "4111111111111111"
-    }
-
-    /// Generate a sample SSN for testing
-    pub fn sample_ssn() -> &'static str {
-        "123-45-6789"
-    }
-
-    /// Generate a sample phone for testing
-    pub fn sample_phone() -> &'static str {
-        "+1-555-123-4567"
-    }
-
-    /// Generate sample SQL containing PII
-    pub fn sample_sql_with_pii() -> String {
-        format!(
-            "INSERT INTO users (email, cc, ssn, phone) VALUES ('{}', '{}', '{}', '{}')",
-            sample_email(),
-            sample_credit_card(),
-            sample_ssn(),
-            sample_phone()
-        )
     }
 }
