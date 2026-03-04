@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
 
@@ -178,6 +178,64 @@ async fn run_health_check_task(
 fn update_upstream_pool_metrics(pool: &Semaphore, max_size: usize) {
     let active = max_size.saturating_sub(pool.available_permits());
     metrics::set_upstream_pool_state(active, max_size);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamPoolAcquireError {
+    Closed,
+    Timeout,
+}
+
+#[derive(Clone)]
+struct UpstreamSlotManager {
+    pool: Arc<Semaphore>,
+    size: usize,
+}
+
+impl UpstreamSlotManager {
+    fn new(size: usize) -> Self {
+        let pool = Arc::new(Semaphore::new(size));
+        update_upstream_pool_metrics(&pool, size);
+        Self { pool, size }
+    }
+
+    #[cfg(test)]
+    fn available_slots(&self) -> usize {
+        self.pool.available_permits()
+    }
+
+    async fn acquire(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<UpstreamSlotLease, UpstreamPoolAcquireError> {
+        match tokio::time::timeout(timeout, self.pool.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                update_upstream_pool_metrics(&self.pool, self.size);
+                Ok(UpstreamSlotLease {
+                    pool: self.pool.clone(),
+                    size: self.size,
+                    permit: Some(permit),
+                })
+            }
+            Ok(Err(_)) => Err(UpstreamPoolAcquireError::Closed),
+            Err(_) => Err(UpstreamPoolAcquireError::Timeout),
+        }
+    }
+}
+
+struct UpstreamSlotLease {
+    pool: Arc<Semaphore>,
+    size: usize,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for UpstreamSlotLease {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+            update_upstream_pool_metrics(&self.pool, self.size);
+        }
+    }
 }
 
 fn resolve_timeout_limits(
@@ -489,12 +547,9 @@ async fn main() -> Result<()> {
     });
 
     // Upstream pool guardrails
-    let upstream_pool_size = config.limits.as_ref().and_then(|l| l.upstream_pool_size);
-    let upstream_pool = upstream_pool_size.map(|size| {
+    let upstream_pool = config.limits.as_ref().and_then(|l| l.upstream_pool_size).map(|size| {
         info!("Upstream pool size set to {}", size);
-        let pool = Arc::new(Semaphore::new(size));
-        update_upstream_pool_metrics(&pool, size);
-        pool
+        UpstreamSlotManager::new(size)
     });
 
     // Rate limiting state
@@ -555,7 +610,6 @@ async fn main() -> Result<()> {
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let upstream_pool = upstream_pool.clone();
-                let configured_upstream_pool_size = upstream_pool_size;
 
                 tokio::spawn(async move {
                     // Hold the permit for the duration of the connection
@@ -571,10 +625,9 @@ async fn main() -> Result<()> {
                     );
 
                     async {
-                        let mut upstream_pool_permit = None;
+                        let mut _upstream_pool_lease = None;
                         if matches!(protocol, DbProtocol::Mysql)
-                            && let (Some(pool), Some(pool_size)) =
-                                (upstream_pool.clone(), configured_upstream_pool_size)
+                            && let Some(pool) = upstream_pool.clone()
                         {
                             let wait_timeout = {
                                 let config = state.config.read().await;
@@ -583,17 +636,14 @@ async fn main() -> Result<()> {
                                 pool_wait_timeout
                             };
                             let wait_started = Instant::now();
-                            match tokio::time::timeout(wait_timeout, pool.clone().acquire_owned())
-                                .await
-                            {
-                                Ok(Ok(permit)) => {
+                            match pool.acquire(wait_timeout).await {
+                                Ok(lease) => {
                                     metrics::record_upstream_pool_wait(
                                         wait_started.elapsed().as_secs_f64(),
                                     );
-                                    update_upstream_pool_metrics(&pool, pool_size);
-                                    upstream_pool_permit = Some((pool, permit, pool_size));
+                                    _upstream_pool_lease = Some(lease);
                                 }
-                                Ok(Err(_)) => {
+                                Err(UpstreamPoolAcquireError::Closed) => {
                                     warn!(
                                         "Upstream pool closed while acquiring slot for {}",
                                         client_addr
@@ -608,7 +658,7 @@ async fn main() -> Result<()> {
                                     .await;
                                     return;
                                 }
-                                Err(_) => {
+                                Err(UpstreamPoolAcquireError::Timeout) => {
                                     warn!(
                                         "Timed out waiting for upstream pool slot after {:?} for {}",
                                         wait_timeout, client_addr
@@ -645,7 +695,6 @@ async fn main() -> Result<()> {
                                     state.clone(),
                                     tls_acceptor,
                                     upstream_pool.clone(),
-                                    configured_upstream_pool_size,
                                 )
                                 .await
                             }
@@ -661,11 +710,6 @@ async fn main() -> Result<()> {
                         };
                         state.active_connections.fetch_sub(1, Ordering::Relaxed);
                         metrics::record_connection_closed();
-
-                        if let Some((pool, permit, pool_size)) = upstream_pool_permit {
-                            drop(permit);
-                            update_upstream_pool_metrics(&pool, pool_size);
-                        }
 
                         if let Err(e) = result {
                             tracing::error!(error = %e, "Connection error");
@@ -723,8 +767,7 @@ async fn process_postgres_connection(
     upstream_port: u16,
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
-    upstream_pool: Option<Arc<Semaphore>>,
-    upstream_pool_size: Option<usize>,
+    upstream_pool: Option<UpstreamSlotManager>,
 ) -> Result<()> {
     let mut buffer = [0u8; 8];
     let n = client_socket.peek(&mut buffer).await?;
@@ -756,7 +799,6 @@ async fn process_postgres_connection(
                     upstream_port,
                     state,
                     upstream_pool,
-                    upstream_pool_size,
                 )
                 .await;
             } else {
@@ -772,7 +814,6 @@ async fn process_postgres_connection(
         upstream_port,
         state,
         upstream_pool,
-        upstream_pool_size,
     )
     .await
 }
@@ -796,8 +837,7 @@ async fn handle_postgres_protocol<S>(
     upstream_host: String,
     upstream_port: u16,
     state: AppState,
-    upstream_pool: Option<Arc<Semaphore>>,
-    upstream_pool_size: Option<usize>,
+    upstream_pool: Option<UpstreamSlotManager>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -810,16 +850,15 @@ where
         resolve_timeout_limits(config.limits.as_ref())
     };
 
-    let mut upstream_pool_permit = None;
-    if let (Some(pool), Some(pool_size)) = (upstream_pool, upstream_pool_size) {
+    let mut _upstream_pool_lease = None;
+    if let Some(pool) = upstream_pool {
         let wait_started = Instant::now();
-        match tokio::time::timeout(pool_wait_timeout, pool.clone().acquire_owned()).await {
-            Ok(Ok(permit)) => {
+        match pool.acquire(pool_wait_timeout).await {
+            Ok(lease) => {
                 metrics::record_upstream_pool_wait(wait_started.elapsed().as_secs_f64());
-                update_upstream_pool_metrics(&pool, pool_size);
-                upstream_pool_permit = Some((pool, permit, pool_size));
+                _upstream_pool_lease = Some(lease);
             }
-            Ok(Err(_)) => {
+            Err(UpstreamPoolAcquireError::Closed) => {
                 metrics::record_connection_rejected("upstream_pool_closed");
                 let _ = send_postgres_fatal_error_response(
                     &mut client_socket,
@@ -829,7 +868,7 @@ where
                 .await;
                 return Ok(());
             }
-            Err(_) => {
+            Err(UpstreamPoolAcquireError::Timeout) => {
                 metrics::record_upstream_pool_acquire_timeout();
                 metrics::record_connection_rejected("upstream_pool_wait_timeout");
                 let message = format!(
@@ -890,10 +929,6 @@ where
                 idle_timeout,
             )
             .await;
-            if let Some((pool, permit, pool_size)) = upstream_pool_permit {
-                drop(permit);
-                update_upstream_pool_metrics(&pool, pool_size);
-            }
             return result;
         } else {
             tracing::warn!(
@@ -904,13 +939,7 @@ where
     }
 
     // Cleartext connection
-    let result =
-        handle_postgres_protocol_inner(client_socket, upstream_socket, state, idle_timeout).await;
-    if let Some((pool, permit, pool_size)) = upstream_pool_permit {
-        drop(permit);
-        update_upstream_pool_metrics(&pool, pool_size);
-    }
-    result
+    handle_postgres_protocol_inner(client_socket, upstream_socket, state, idle_timeout).await
 }
 
 async fn handle_postgres_protocol_inner<S, U>(
@@ -1302,7 +1331,8 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_mysql_err_packet, build_postgres_fatal_error_packet, resolve_timeout_limits,
+        UpstreamPoolAcquireError, UpstreamSlotManager, build_mysql_err_packet,
+        build_postgres_fatal_error_packet, resolve_timeout_limits,
     };
     use crate::config::LimitsConfig;
     use std::time::Duration;
@@ -1367,5 +1397,32 @@ mod tests {
         assert_eq!(connect, Duration::from_secs(12));
         assert_eq!(idle, Duration::from_secs(34));
         assert_eq!(pool_wait, Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn test_upstream_slot_manager_acquire_and_release() {
+        let manager = UpstreamSlotManager::new(1);
+        assert_eq!(manager.available_slots(), 1);
+
+        let lease = manager
+            .acquire(Duration::from_millis(20))
+            .await
+            .expect("first acquire should succeed");
+        assert_eq!(manager.available_slots(), 0);
+
+        drop(lease);
+        assert_eq!(manager.available_slots(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_upstream_slot_manager_acquire_times_out_when_full() {
+        let manager = UpstreamSlotManager::new(1);
+        let _lease = manager
+            .acquire(Duration::from_millis(20))
+            .await
+            .expect("first acquire should succeed");
+
+        let result = manager.acquire(Duration::from_millis(20)).await;
+        assert!(matches!(result, Err(UpstreamPoolAcquireError::Timeout)));
     }
 }

@@ -206,11 +206,12 @@ health_check:
 
 ### 15. Connection Pooling
 - [ ] Implement reusable upstream session pooling (protocol-safe reset/re-auth)
+- [x] Introduce upstream slot manager abstraction with shared checkout/release lifecycle
 - [x] Add upstream pool size and wait-time configuration guardrails
 - [x] Add upstream pool saturation and wait-time metrics
 
 **Status Note:**
-- Current implementation provides upstream slot management (`upstream_pool_size`) and visibility (`ironveil_upstream_pool_*` metrics).
+- Current implementation provides upstream slot management (`upstream_pool_size`) with a shared `UpstreamSlotManager` lifecycle and visibility (`ironveil_upstream_pool_*` metrics).
 - Full reusable session pooling remains pending because PostgreSQL/MySQL session state requires safe reset semantics.
 
 **Files:** `src/main.rs`, `src/config.rs`, `src/metrics.rs`, `README.md`
