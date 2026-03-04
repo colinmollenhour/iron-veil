@@ -42,6 +42,10 @@
 *   **Theme Support**: Dark, light, and system themes with persistent preference.
 *   **Responsive Design**: Modern UI built with React, Tailwind CSS, and Framer Motion.
 
+## Dashboard View
+
+![IronVeil Dashboard View](assets/dashboard-view.png)
+
 ## Tech Stack
 
 *   **Core**: Rust 2024 Edition (Tokio, Axum, tokio-util)
