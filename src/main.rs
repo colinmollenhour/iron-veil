@@ -547,10 +547,14 @@ async fn main() -> Result<()> {
     });
 
     // Upstream pool guardrails
-    let upstream_pool = config.limits.as_ref().and_then(|l| l.upstream_pool_size).map(|size| {
-        info!("Upstream pool size set to {}", size);
-        UpstreamSlotManager::new(size)
-    });
+    let upstream_pool = config
+        .limits
+        .as_ref()
+        .and_then(|l| l.upstream_pool_size)
+        .map(|size| {
+            info!("Upstream pool size set to {}", size);
+            UpstreamSlotManager::new(size)
+        });
 
     // Rate limiting state
     let rate_limit = config
