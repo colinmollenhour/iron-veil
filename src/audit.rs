@@ -120,13 +120,6 @@ impl AuditEntry {
         }
     }
 
-    /// Set the client IP
-    #[allow(dead_code)]
-    pub fn with_client_ip(mut self, ip: impl Into<String>) -> Self {
-        self.client_ip = Some(ip.into());
-        self
-    }
-
     /// Set the authentication method
     pub fn with_auth_method(mut self, method: AuthMethod) -> Self {
         self.auth_method = Some(method);
@@ -245,23 +238,6 @@ impl AuditLogger {
         }
     }
 
-    /// Create a disabled audit logger
-    #[allow(dead_code)]
-    pub fn disabled() -> Self {
-        Self::new(AuditConfig {
-            enabled: false,
-            ..Default::default()
-        })
-    }
-
-    /// Update the audit logger configuration
-    #[allow(dead_code)]
-    pub async fn update_config(&self, config: AuditConfig) {
-        let log_file_path = config.log_file.as_ref().map(PathBuf::from);
-        *self.config.write().await = config;
-        *self.log_file_path.write().await = log_file_path;
-    }
-
     /// Check if a specific event type should be logged
     async fn should_log(&self, event_type: &AuditEventType) -> bool {
         let config = self.config.read().await;
@@ -321,12 +297,26 @@ impl AuditLogger {
         entry: &AuditEntry,
         config: &AuditConfig,
     ) -> std::io::Result<()> {
+        let path = path.to_path_buf();
+        let entry = entry.clone();
+        let config = config.clone();
+
+        tokio::task::spawn_blocking(move || Self::write_to_file_blocking(&path, &entry, &config))
+            .await
+            .map_err(|e| std::io::Error::other(format!("audit write task failed: {}", e)))?
+    }
+
+    fn write_to_file_blocking(
+        path: &Path,
+        entry: &AuditEntry,
+        config: &AuditConfig,
+    ) -> std::io::Result<()> {
         // Check if rotation is needed
         if config.rotation_enabled
             && let Ok(metadata) = std::fs::metadata(path)
             && metadata.len() >= config.max_file_size_bytes
         {
-            self.rotate_logs(path, config.max_rotated_files)?;
+            Self::rotate_logs_blocking(path, config.max_rotated_files)?;
         }
 
         // Open file in append mode
@@ -342,7 +332,7 @@ impl AuditLogger {
     }
 
     /// Rotate log files
-    fn rotate_logs(&self, path: &Path, max_files: usize) -> std::io::Result<()> {
+    fn rotate_logs_blocking(path: &Path, max_files: usize) -> std::io::Result<()> {
         // Delete the oldest file if we're at max
         let oldest = format!("{}.{}", path.display(), max_files);
         if Path::new(&oldest).exists() {
@@ -482,17 +472,17 @@ impl AuditLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_audit_entry_creation() {
         let entry = AuditEntry::new(AuditEventType::AuthAttempt, AuditOutcome::Success)
-            .with_client_ip("127.0.0.1")
             .with_auth_method(AuthMethod::ApiKey)
             .with_endpoint("/rules");
 
         assert_eq!(entry.event_type, AuditEventType::AuthAttempt);
         assert_eq!(entry.outcome, AuditOutcome::Success);
-        assert_eq!(entry.client_ip, Some("127.0.0.1".to_string()));
+        assert_eq!(entry.client_ip, None);
         assert_eq!(entry.auth_method, Some(AuthMethod::ApiKey));
         assert_eq!(entry.endpoint, Some("/rules".to_string()));
     }
@@ -534,7 +524,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_audit_logger_disabled() {
-        let logger = AuditLogger::disabled();
+        let logger = AuditLogger::new(AuditConfig {
+            enabled: false,
+            ..Default::default()
+        });
 
         logger
             .log(AuditEntry::new(
@@ -681,5 +674,21 @@ mod tests {
 
         let entries = logger.get_entries(None).await;
         assert!(entries.len() <= MAX_MEMORY_ENTRIES);
+    }
+
+    #[test]
+    fn test_write_to_file_blocking_writes_json_line() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let entry = AuditEntry::new(AuditEventType::ConfigChange, AuditOutcome::Success)
+            .with_details(serde_json::json!({"k":"v"}));
+        let config = AuditConfig::default();
+
+        AuditLogger::write_to_file_blocking(&path, &entry, &config).unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.contains("\"event_type\":\"config_change\""));
+        assert!(content.ends_with('\n'));
     }
 }

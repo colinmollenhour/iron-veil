@@ -123,8 +123,6 @@ pub struct EofPacket {
 }
 
 // Capability flags
-#[allow(dead_code)]
-pub const CLIENT_LONG_PASSWORD: u32 = 1;
 pub const CLIENT_PROTOCOL_41: u32 = 1 << 9;
 pub const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 pub const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
