@@ -1,3 +1,4 @@
+use crate::metrics;
 use crate::protocol::mysql::{ColumnDefinition, ResultRow};
 use crate::protocol::postgres::{DataRow, RowDescription};
 use crate::scanner::{PiiScanner, PiiType};
@@ -263,25 +264,33 @@ impl PacketInterceptor for Anonymizer {
                     .map(|(_, strategy)| strategy.as_str());
 
                 // Handle explicit JSON strategy
-                if let Some("json") = explicit_strategy
-                    && let Ok(s) = std::str::from_utf8(val)
-                    && let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(s)
-                {
-                    mask_json_recursively(&mut json_val, &self.scanner);
-                    let new_json = serde_json::to_string(&json_val)?;
-
-                    if new_json.as_bytes() != &val[..] {
-                        val.clear();
-                        val.extend_from_slice(new_json.as_bytes());
-                        changed_any = true;
-                        // Record masking stats for JSON
-                        self.state.record_masking("json").await;
-                        changes_log.push(json!({
-                            "column_idx": i,
-                            "strategy": "json",
-                            "original": original_val_preview,
-                            "masked": "(JSON Masked)"
-                        }));
+                if let Some("json") = explicit_strategy {
+                    match std::str::from_utf8(val) {
+                        Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                            Ok(mut json_val) => {
+                                mask_json_recursively(&mut json_val, &self.scanner);
+                                match serde_json::to_string(&json_val) {
+                                    Ok(new_json) => {
+                                        if new_json.as_bytes() != &val[..] {
+                                            val.clear();
+                                            val.extend_from_slice(new_json.as_bytes());
+                                            changed_any = true;
+                                            // Record masking stats for JSON
+                                            self.state.record_masking("json").await;
+                                            changes_log.push(json!({
+                                                "column_idx": i,
+                                                "strategy": "json",
+                                                "original": original_val_preview,
+                                                "masked": "(JSON Masked)"
+                                            }));
+                                        }
+                                    }
+                                    Err(_) => metrics::record_masking_error(),
+                                }
+                            }
+                            Err(_) => metrics::record_masking_error(),
+                        },
+                        Err(_) => metrics::record_masking_error(),
                     }
                     continue;
                 }
@@ -487,26 +496,34 @@ impl MySqlPacketInterceptor for MySqlAnonymizer {
                     .map(|(_, strategy)| strategy.as_str());
 
                 // Handle explicit JSON strategy
-                if let Some("json") = explicit_strategy
-                    && let Ok(s) = std::str::from_utf8(val)
-                    && let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(s)
-                {
-                    mask_json_recursively(&mut json_val, &self.scanner);
-                    if let Ok(new_json) = serde_json::to_string(&json_val)
-                        && new_json.as_bytes() != &val[..]
-                    {
-                        val.clear();
-                        val.extend_from_slice(new_json.as_bytes());
-                        changed_any = true;
-                        // Record masking stats for JSON
-                        self.state.record_masking("json").await;
-                        changes_log.push(json!({
-                            "column_idx": i,
-                            "column_name": self.column_names.get(i).unwrap_or(&"?".to_string()),
-                            "strategy": "json",
-                            "original": original_val_preview,
-                            "masked": "(JSON Masked)"
-                        }));
+                if let Some("json") = explicit_strategy {
+                    match std::str::from_utf8(val) {
+                        Ok(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                            Ok(mut json_val) => {
+                                mask_json_recursively(&mut json_val, &self.scanner);
+                                match serde_json::to_string(&json_val) {
+                                    Ok(new_json) => {
+                                        if new_json.as_bytes() != &val[..] {
+                                            val.clear();
+                                            val.extend_from_slice(new_json.as_bytes());
+                                            changed_any = true;
+                                            // Record masking stats for JSON
+                                            self.state.record_masking("json").await;
+                                            changes_log.push(json!({
+                                                "column_idx": i,
+                                                "column_name": self.column_names.get(i).unwrap_or(&"?".to_string()),
+                                                "strategy": "json",
+                                                "original": original_val_preview,
+                                                "masked": "(JSON Masked)"
+                                            }));
+                                        }
+                                    }
+                                    Err(_) => metrics::record_masking_error(),
+                                }
+                            }
+                            Err(_) => metrics::record_masking_error(),
+                        },
+                        Err(_) => metrics::record_masking_error(),
                     }
                     continue;
                 }

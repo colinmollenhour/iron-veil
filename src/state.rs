@@ -1,5 +1,6 @@
 use crate::audit::AuditLogger;
 use crate::config::AppConfig;
+use crate::metrics;
 use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,15 @@ impl Default for HealthStatus {
 pub enum DbProtocol {
     Postgres,
     MySql,
+}
+
+impl DbProtocol {
+    fn metrics_label(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::MySql => "mysql",
+        }
+    }
 }
 
 /// Statistics for masking operations by strategy
@@ -270,12 +280,6 @@ impl AppState {
         logs.push_front(entry);
     }
 
-    /// Check if upstream is healthy (fast atomic check)
-    #[allow(dead_code)]
-    pub fn is_upstream_healthy(&self) -> bool {
-        self.upstream_healthy.load(Ordering::Relaxed)
-    }
-
     /// Update upstream health status
     pub async fn update_health_status(
         &self,
@@ -344,12 +348,20 @@ impl AppState {
     pub async fn record_masking(&self, strategy: &str) {
         let mut stats = self.stats.write().await;
         stats.masking.increment(strategy);
+        drop(stats);
+        metrics::record_fields_masked(1);
     }
 
     /// Record a query by type (SELECT, INSERT, UPDATE, DELETE, etc.)
     pub async fn record_query(&self, query_type: &str) {
+        let started_at = std::time::Instant::now();
         let mut stats = self.stats.write().await;
         stats.queries.record_query(query_type);
+        drop(stats);
+        metrics::record_query_processed(
+            self.db_protocol.metrics_label(),
+            started_at.elapsed().as_secs_f64(),
+        );
     }
 
     /// Increment connection count
@@ -398,6 +410,20 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::metrics::init_metrics;
+
+    fn metric_value(rendered: &str, metric_name: &str) -> f64 {
+        rendered
+            .lines()
+            .find_map(|line| {
+                if line.starts_with(metric_name) {
+                    line.split_whitespace().nth(1)?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0)
+    }
 
     #[test]
     fn test_masking_stats_increment() {
@@ -588,5 +614,91 @@ mod tests {
 
         let history = state.get_connection_history().await;
         assert_eq!(history.len(), 60, "History should be capped at 60 entries");
+    }
+
+    #[tokio::test]
+    async fn test_app_state_record_query_emits_prometheus_metric() {
+        let handle = init_metrics();
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![],
+            tls: None,
+            upstream_tls: false,
+            telemetry: None,
+            api: None,
+            limits: None,
+            health_check: None,
+            audit: None,
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string()).with_metrics(handle);
+
+        let before = state
+            .metrics_handle
+            .as_ref()
+            .expect("metrics handle should be attached")
+            .render();
+        let before_total = metric_value(&before, "ironveil_queries_total{protocol=\"postgres\"}");
+        let before_duration_count = metric_value(
+            &before,
+            "ironveil_query_duration_seconds_count{protocol=\"postgres\"}",
+        );
+
+        state.record_query("SELECT").await;
+
+        let after = state
+            .metrics_handle
+            .as_ref()
+            .expect("metrics handle should be attached")
+            .render();
+        let after_total = metric_value(&after, "ironveil_queries_total{protocol=\"postgres\"}");
+        let after_duration_count = metric_value(
+            &after,
+            "ironveil_query_duration_seconds_count{protocol=\"postgres\"}",
+        );
+        assert!(
+            after_total > before_total,
+            "query counter should be emitted when recording query stats"
+        );
+        assert!(
+            after_duration_count > before_duration_count,
+            "query duration metric should be emitted when recording query stats"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_app_state_record_masking_emits_prometheus_metric() {
+        let handle = init_metrics();
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![],
+            tls: None,
+            upstream_tls: false,
+            telemetry: None,
+            api: None,
+            limits: None,
+            health_check: None,
+            audit: None,
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string()).with_metrics(handle);
+
+        let before = state
+            .metrics_handle
+            .as_ref()
+            .expect("metrics handle should be attached")
+            .render();
+        let before_total = metric_value(&before, "ironveil_fields_masked_total");
+
+        state.record_masking("email").await;
+
+        let after = state
+            .metrics_handle
+            .as_ref()
+            .expect("metrics handle should be attached")
+            .render();
+        let after_total = metric_value(&after, "ironveil_fields_masked_total");
+        assert!(
+            after_total > before_total,
+            "fields-masked counter should be emitted when recording masking stats"
+        );
     }
 }

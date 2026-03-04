@@ -26,26 +26,22 @@ pub fn init_metrics() -> PrometheusHandle {
 }
 
 /// Record a new connection
-#[allow(dead_code)]
 pub fn record_connection_opened() {
     counter!("ironveil_connections_total").increment(1);
     gauge!("ironveil_connections_active").increment(1.0);
 }
 
 /// Record connection closed
-#[allow(dead_code)]
 pub fn record_connection_closed() {
     gauge!("ironveil_connections_active").decrement(1.0);
 }
 
 /// Record a connection rejected (rate limit or max connections)
-#[allow(dead_code)]
 pub fn record_connection_rejected(reason: &str) {
     counter!("ironveil_connections_rejected_total", "reason" => reason.to_string()).increment(1);
 }
 
 /// Record query processed
-#[allow(dead_code)]
 pub fn record_query_processed(protocol: &str, duration_secs: f64) {
     counter!("ironveil_queries_total", "protocol" => protocol.to_string()).increment(1);
     histogram!("ironveil_query_duration_seconds", "protocol" => protocol.to_string())
@@ -53,19 +49,16 @@ pub fn record_query_processed(protocol: &str, duration_secs: f64) {
 }
 
 /// Record fields masked
-#[allow(dead_code)]
 pub fn record_fields_masked(count: u64) {
     counter!("ironveil_fields_masked_total").increment(count);
 }
 
 /// Record masking error
-#[allow(dead_code)]
 pub fn record_masking_error() {
     counter!("ironveil_masking_errors_total").increment(1);
 }
 
 /// Record upstream health check
-#[allow(dead_code)]
 pub fn record_health_check(healthy: bool, latency_ms: Option<u64>) {
     if let Some(latency) = latency_ms {
         histogram!("ironveil_upstream_health_check_latency_ms").record(latency as f64);
@@ -78,31 +71,26 @@ pub fn record_health_check(healthy: bool, latency_ms: Option<u64>) {
 }
 
 /// Record upstream connection timeout
-#[allow(dead_code)]
 pub fn record_upstream_timeout() {
     counter!("ironveil_upstream_timeouts_total").increment(1);
 }
 
 /// Record idle connection timeout
-#[allow(dead_code)]
 pub fn record_idle_timeout() {
     counter!("ironveil_idle_timeouts_total").increment(1);
 }
 
 /// Record wait time while acquiring an upstream pool slot.
-#[allow(dead_code)]
 pub fn record_upstream_pool_wait(duration_secs: f64) {
     histogram!("ironveil_upstream_pool_wait_seconds").record(duration_secs);
 }
 
 /// Record timeout waiting for an upstream pool slot.
-#[allow(dead_code)]
 pub fn record_upstream_pool_acquire_timeout() {
     counter!("ironveil_upstream_pool_acquire_timeouts_total").increment(1);
 }
 
 /// Set upstream pool utilization gauges.
-#[allow(dead_code)]
 pub fn set_upstream_pool_state(active: usize, max: usize) {
     let utilization = if max == 0 {
         0.0
