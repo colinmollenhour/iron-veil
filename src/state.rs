@@ -282,7 +282,7 @@ impl AppState {
     /// Live state is untouched when persistence fails, so the on-disk policy
     /// can never silently diverge from runtime behaviour.
     pub async fn commit_config(&self, new_config: AppConfig) -> Result<(), std::io::Error> {
-        let yaml = serde_yaml::to_string(&new_config)
+        let yaml = serde_yaml_ng::to_string(&new_config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let path = self.config_path.as_ref().clone();
         tokio::task::spawn_blocking(move || {
@@ -383,26 +383,26 @@ impl AppState {
         {
             let current = self.config.read().await;
             let mut restart_required = Vec::new();
-            if serde_yaml::to_string(&current.tls).ok()
-                != serde_yaml::to_string(&new_config.tls).ok()
+            if serde_yaml_ng::to_string(&current.tls).ok()
+                != serde_yaml_ng::to_string(&new_config.tls).ok()
             {
                 restart_required.push("tls");
             }
             if current.upstream_tls != new_config.upstream_tls {
                 restart_required.push("upstream_tls");
             }
-            if serde_yaml::to_string(&current.limits).ok()
-                != serde_yaml::to_string(&new_config.limits).ok()
+            if serde_yaml_ng::to_string(&current.limits).ok()
+                != serde_yaml_ng::to_string(&new_config.limits).ok()
             {
                 restart_required.push("limits");
             }
-            if serde_yaml::to_string(&current.telemetry).ok()
-                != serde_yaml::to_string(&new_config.telemetry).ok()
+            if serde_yaml_ng::to_string(&current.telemetry).ok()
+                != serde_yaml_ng::to_string(&new_config.telemetry).ok()
             {
                 restart_required.push("telemetry");
             }
-            if serde_yaml::to_string(&current.api).ok()
-                != serde_yaml::to_string(&new_config.api).ok()
+            if serde_yaml_ng::to_string(&current.api).ok()
+                != serde_yaml_ng::to_string(&new_config.api).ok()
             {
                 restart_required.push("api");
             }
@@ -436,13 +436,20 @@ impl AppState {
         metrics::record_fields_masked(1);
     }
 
-    /// Record a query by type (SELECT, INSERT, UPDATE, DELETE, etc.)
+    /// Record a query by type (SELECT, INSERT, UPDATE, DELETE, etc.).
+    /// Counting only — latency is recorded by `record_query_latency` when the
+    /// result set terminates. Timing this call measured a lock acquisition,
+    /// not the upstream round trip, so the latency panels read ~0 forever.
     pub async fn record_query(&self, query_type: &str) {
-        let started_at = std::time::Instant::now();
         let mut stats = self.stats.write().await;
         stats.queries.record_query(query_type);
         drop(stats);
-        metrics::record_query_processed(
+        metrics::record_query_processed(self.db_protocol.metrics_label());
+    }
+
+    /// Record the observed round trip for a completed query.
+    pub fn record_query_latency(&self, started_at: std::time::Instant) {
+        metrics::record_query_duration(
             self.db_protocol.metrics_label(),
             started_at.elapsed().as_secs_f64(),
         );
@@ -692,6 +699,7 @@ mod tests {
         );
 
         state.record_query("SELECT").await;
+        state.record_query_latency(std::time::Instant::now());
 
         let after = state
             .metrics_handle
@@ -709,7 +717,7 @@ mod tests {
         );
         assert!(
             after_duration_count > before_duration_count,
-            "query duration metric should be emitted when recording query stats"
+            "query duration metric should be emitted when a query round trip completes"
         );
     }
 

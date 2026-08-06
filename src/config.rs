@@ -354,7 +354,7 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let mut config: AppConfig = serde_yaml::from_str(&content)?;
+        let mut config: AppConfig = serde_yaml_ng::from_str(&content)?;
         if let Ok(secret) = std::env::var("IRONVEIL_MASKING_SECRET")
             && !secret.is_empty()
         {
@@ -407,7 +407,7 @@ rules:
   - column: "phone"
     strategy: "phone"
 "#;
-        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert!(config.masking_enabled);
         assert!(!config.upstream_tls);
@@ -423,7 +423,7 @@ rules:
         let yaml = r#"
 rules: []
 "#;
-        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert!(config.masking_enabled); // Should default to true
         assert!(!config.upstream_tls); // Should default to false
@@ -441,7 +441,7 @@ tls:
   key_path: "certs/server.key"
 rules: []
 "#;
-        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
 
         assert!(config.upstream_tls);
         assert!(config.tls.is_some());
@@ -457,7 +457,7 @@ rules: []
         let yaml = r#"
 invalid yaml content {{
 "#;
-        let result: Result<AppConfig, _> = serde_yaml::from_str(yaml);
+        let result: Result<AppConfig, _> = serde_yaml_ng::from_str(yaml);
         assert!(result.is_err());
     }
 
@@ -466,7 +466,7 @@ invalid yaml content {{
         let yaml = r#"
 masking_enabled: true
 "#;
-        let result: Result<AppConfig, _> = serde_yaml::from_str(yaml);
+        let result: Result<AppConfig, _> = serde_yaml_ng::from_str(yaml);
         assert!(result.is_err()); // Should fail because 'rules' is missing
     }
 
@@ -476,7 +476,7 @@ masking_enabled: true
 rules: []
 limits: {}
 "#;
-        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let limits = config.limits.expect("limits should be present");
 
         assert_eq!(limits.connect_timeout_secs, 30);
@@ -493,7 +493,7 @@ limits:
   upstream_pool_size: 50
   upstream_pool_wait_timeout_secs: 12
 "#;
-        let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
         let limits = config.limits.expect("limits should be present");
 
         assert_eq!(limits.upstream_pool_size, Some(50));

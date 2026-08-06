@@ -55,9 +55,13 @@ pub fn record_connection_rejected(reason: &str) {
     counter!("ironveil_connections_rejected_total", "reason" => reason.to_string()).increment(1);
 }
 
-/// Record query processed
-pub fn record_query_processed(protocol: &str, duration_secs: f64) {
+/// Record that a query was seen (counter only).
+pub fn record_query_processed(protocol: &str) {
     counter!("ironveil_queries_total", "protocol" => protocol.to_string()).increment(1);
+}
+
+/// Record the round trip from the client's query to the result-set terminator.
+pub fn record_query_duration(protocol: &str, duration_secs: f64) {
     histogram!("ironveil_query_duration_seconds", "protocol" => protocol.to_string())
         .record(duration_secs);
 }

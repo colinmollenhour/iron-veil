@@ -1094,6 +1094,8 @@ where
     let connection_id = rand::random::<u64>() as usize;
     let mut interceptor = Anonymizer::new(state.clone(), connection_id);
     let mut postgres_oid_bootstrap_done = false;
+    // Start of the in-flight query, for the round-trip latency histogram.
+    let mut query_started_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -1126,6 +1128,7 @@ where
                                     .unwrap_or("OTHER")
                                     .to_uppercase();
                                 state.record_query(&query_type).await;
+                                query_started_at = Some(Instant::now());
 
                                 // Drop any stale index->strategy map from a previous
                                 // statement before its result set arrives.
@@ -1152,6 +1155,7 @@ where
                                     .unwrap_or("OTHER")
                                     .to_uppercase();
                                 state.record_query(&query_type).await;
+                                query_started_at = Some(Instant::now());
 
                                 interceptor.reset_columns();
 
@@ -1207,6 +1211,13 @@ where
                                 client_framed.send(PgMessage::DataRow(new_dr)).await?;
                             }
                             other => {
+                                // ReadyForQuery ends the query round trip.
+                                if let PgMessage::Regular(ref regular) = other
+                                    && regular.message_type == b'Z'
+                                    && let Some(started) = query_started_at.take()
+                                {
+                                    state.record_query_latency(started);
+                                }
                                 // COPY TO STDOUT bypasses the DataRow interceptor entirely.
                                 // Make the unmasked path visible instead of silent.
                                 if let PgMessage::Regular(ref regular) = other
@@ -1430,6 +1441,8 @@ async fn handle_mysql_protocol(
 
     let connection_id = rand::random::<u64>() as usize;
     let mut interceptor = MySqlAnonymizer::new(state.clone(), connection_id);
+    // Start of the in-flight query, for the round-trip latency histogram.
+    let mut query_started_at: Option<Instant> = None;
 
     // Phase 1: Forward handshake from upstream to client
     let handshake = match upstream_framed.next().await {
@@ -1648,6 +1661,7 @@ async fn handle_mysql_protocol(
                                     .unwrap_or("OTHER")
                                     .to_uppercase();
                                 state.record_query(&query_type).await;
+                                query_started_at = Some(Instant::now());
 
                                 // Reset interceptor and response codec for the
                                 // new result set — a desynced response stream
@@ -1692,6 +1706,15 @@ async fn handle_mysql_protocol(
             msg = upstream_framed.next() => {
                 match msg {
                     Some(Ok(msg)) => {
+                        // A result-set terminator, OK or ERR ends the round trip.
+                        if matches!(
+                            msg,
+                            MySqlMessage::Ok(_) | MySqlMessage::Err(_) | MySqlMessage::Generic(_)
+                        ) && let Some(started) = query_started_at.take()
+                        {
+                            state.record_query_latency(started);
+                        }
+
                         let msg_to_send = match msg {
                             MySqlMessage::ColumnDefinition(ref col) => {
                                 interceptor.on_column_definition(col).await;
