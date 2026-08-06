@@ -873,6 +873,7 @@ mod tests {
             api: Some(ApiConfig {
                 api_key: Some("my-secret-key".to_string()),
                 jwt_secret: None,
+                bind: None,
             }),
             ..Default::default()
         };
@@ -974,6 +975,7 @@ mod tests {
             api: Some(ApiConfig {
                 api_key: None,
                 jwt_secret: Some("my-jwt-secret".to_string()),
+                bind: None,
             }),
             ..Default::default()
         };
@@ -997,13 +999,7 @@ mod tests {
                 column: "email".to_string(),
                 strategy: "email".to_string(),
             }],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -1027,13 +1023,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, config_path);
 
@@ -1061,13 +1051,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, config_path);
 
@@ -1211,13 +1195,7 @@ mod tests {
                 column: "email".to_string(),
                 strategy: "email".to_string(),
             }],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -1332,13 +1310,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 

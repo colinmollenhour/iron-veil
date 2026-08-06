@@ -2,11 +2,50 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+/// Masking strategies understood by the interceptor. Anything else is rejected
+/// at config load / rule ingest so a typo cannot silently degrade to "MASKED".
+pub const KNOWN_STRATEGIES: &[&str] = &[
+    "email",
+    "phone",
+    "address",
+    "name",
+    "text",
+    "credit_card",
+    "ssn",
+    "ip",
+    "dob",
+    "passport",
+    "hash",
+    "json",
+];
+
+/// Heuristic detector names accepted in `heuristics.types`.
+pub const KNOWN_HEURISTIC_TYPES: &[&str] = &[
+    "email",
+    "phone",
+    "ssn",
+    "credit_card",
+    "ip",
+    "dob",
+    "passport",
+];
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default = "default_masking_enabled")]
     pub masking_enabled: bool,
     pub rules: Vec<MaskingRule>,
+    /// Secret used to key the deterministic masking functions (fake-data seeds
+    /// and the `hash` strategy). When unset, a random per-process key is used,
+    /// which keeps masking deterministic within a run but not across restarts.
+    /// Can also be supplied via the IRONVEIL_MASKING_SECRET env var, which
+    /// takes precedence over this field.
+    #[serde(default)]
+    pub masking_secret: Option<String>,
+    /// Heuristic (rule-less) PII detection settings.
+    #[serde(default)]
+    pub heuristics: Option<HeuristicsConfig>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     #[serde(default)]
@@ -23,7 +62,39 @@ pub struct AppConfig {
     pub audit: Option<AuditConfig>,
 }
 
+/// Controls the heuristic scanner that masks values in columns with no
+/// explicit rule. Only the detectors listed in `types` run; the ambiguous
+/// detectors (`credit_card`, `ip`, `dob`, `passport`) are opt-in because they
+/// rewrite legitimate data (order numbers, config addresses, every date
+/// column) when enabled on a schema that stores such values.
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HeuristicsConfig {
+    #[serde(default = "default_heuristics_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_heuristic_types")]
+    pub types: Vec<String>,
+}
+
+impl Default for HeuristicsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            types: default_heuristic_types(),
+        }
+    }
+}
+
+fn default_heuristics_enabled() -> bool {
+    true
+}
+
+fn default_heuristic_types() -> Vec<String> {
+    vec!["email".to_string(), "phone".to_string(), "ssn".to_string()]
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Maximum number of concurrent connections (default: unlimited)
     #[serde(default)]
@@ -64,6 +135,7 @@ fn default_upstream_pool_wait_timeout() -> u64 {
 
 /// Health check configuration for upstream database
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheckConfig {
     /// Enable upstream health checks (default: true)
     #[serde(default = "default_health_enabled")]
@@ -119,6 +191,7 @@ fn default_healthy_threshold() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     /// API key for authenticating management API requests.
     /// If set, all sensitive endpoints require `X-API-Key` header.
@@ -129,6 +202,11 @@ pub struct ApiConfig {
     /// If set, endpoints also accept `Authorization: Bearer <token>` header.
     #[serde(default)]
     pub jwt_secret: Option<String>,
+
+    /// Address the management API binds to (default: 127.0.0.1). Binding a
+    /// non-loopback address requires api_key or jwt_secret to be configured.
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 /// Audit event types to log
@@ -148,6 +226,7 @@ pub enum AuditEventType {
 
 /// Configuration for audit logging
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConfig {
     /// Enable audit logging (default: true)
     #[serde(default = "default_audit_enabled")]
@@ -209,6 +288,7 @@ impl Default for AuditConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub enabled: bool,
     pub cert_path: String,
@@ -216,6 +296,7 @@ pub struct TlsConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -238,6 +319,7 @@ fn default_masking_enabled() -> bool {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MaskingRule {
     pub table: Option<String>,
     pub column: String,
@@ -249,6 +331,8 @@ impl Default for AppConfig {
         Self {
             masking_enabled: true,
             rules: vec![],
+            masking_secret: None,
+            heuristics: None,
             tls: None,
             upstream_tls: false,
             telemetry: None,
@@ -263,8 +347,40 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let config: AppConfig = serde_yaml::from_str(&content)?;
+        let mut config: AppConfig = serde_yaml::from_str(&content)?;
+        if let Ok(secret) = std::env::var("IRONVEIL_MASKING_SECRET")
+            && !secret.is_empty()
+        {
+            config.masking_secret = Some(secret);
+        }
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Reject configs that would silently misbehave at runtime.
+    pub fn validate(&self) -> Result<()> {
+        for rule in &self.rules {
+            if !KNOWN_STRATEGIES.contains(&rule.strategy.as_str()) {
+                anyhow::bail!(
+                    "unknown masking strategy '{}' for column '{}' (known: {})",
+                    rule.strategy,
+                    rule.column,
+                    KNOWN_STRATEGIES.join(", ")
+                );
+            }
+        }
+        if let Some(heuristics) = &self.heuristics {
+            for t in &heuristics.types {
+                if !KNOWN_HEURISTIC_TYPES.contains(&t.as_str()) {
+                    anyhow::bail!(
+                        "unknown heuristic type '{}' (known: {})",
+                        t,
+                        KNOWN_HEURISTIC_TYPES.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 

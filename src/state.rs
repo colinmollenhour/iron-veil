@@ -171,6 +171,23 @@ pub struct AppState {
     pub stats: Arc<RwLock<AppStats>>,
     /// Connection history for charts (last 60 data points)
     pub connection_history: Arc<RwLock<VecDeque<ConnectionDataPoint>>>,
+    /// Key for the deterministic masking functions. Derived from
+    /// `masking_secret` when configured, otherwise random per process.
+    masking_key: Arc<std::sync::RwLock<[u8; 32]>>,
+}
+
+fn derive_masking_key(secret: Option<&str>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    match secret {
+        Some(secret) if !secret.is_empty() => Sha256::digest(secret.as_bytes()).into(),
+        _ => {
+            tracing::warn!(
+                "masking_secret is not configured; using a random per-process key. \
+                 Masked output will not be stable across restarts."
+            );
+            rand::random()
+        }
+    }
 }
 
 impl AppState {
@@ -230,6 +247,8 @@ impl AppState {
             })
             .unwrap_or_else(|| AuditLogger::new(crate::audit::AuditConfig::default()));
 
+        let masking_key = derive_masking_key(config.masking_secret.as_deref());
+
         Self {
             config: Arc::new(RwLock::new(config)),
             config_path: Arc::new(config_path),
@@ -244,7 +263,16 @@ impl AppState {
             audit_logger: Arc::new(audit_logger),
             stats: Arc::new(RwLock::new(AppStats::default())),
             connection_history: Arc::new(RwLock::new(VecDeque::with_capacity(60))),
+            masking_key: Arc::new(std::sync::RwLock::new(masking_key)),
         }
+    }
+
+    /// Current masking key (copied out; the key is only 32 bytes).
+    pub fn masking_key(&self) -> [u8; 32] {
+        *self
+            .masking_key
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Create a new AppState with default upstream settings (for testing)
@@ -329,6 +357,19 @@ impl AppState {
             .map_err(|e| format!("Failed to load config from {}: {}", path, e))?;
 
         let rules_count = new_config.rules.len();
+
+        // A reloaded masking_secret takes effect immediately; when the new
+        // config has none, keep the existing key so determinism is preserved.
+        if let Some(secret) = new_config.masking_secret.as_deref()
+            && !secret.is_empty()
+        {
+            let new_key = derive_masking_key(Some(secret));
+            let mut key = self
+                .masking_key
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *key = new_key;
+        }
 
         // Update the config
         {
@@ -496,13 +537,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -521,13 +556,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -546,13 +575,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -569,13 +592,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -597,13 +614,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string());
 
@@ -622,13 +633,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string()).with_metrics(handle);
 
@@ -671,13 +676,7 @@ mod tests {
         let config = AppConfig {
             masking_enabled: true,
             rules: vec![],
-            tls: None,
-            upstream_tls: false,
-            telemetry: None,
-            api: None,
-            limits: None,
-            health_check: None,
-            audit: None,
+            ..Default::default()
         };
         let state = AppState::new_for_test(config, "proxy.yaml".to_string()).with_metrics(handle);
 
