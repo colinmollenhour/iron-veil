@@ -354,18 +354,23 @@ impl Decoder for MySqlCodec {
             MySqlState::ReadingRows => {
                 let first_byte = packet[0];
 
-                // EOF packet marks end of rows
-                if first_byte == 0xfe && packet.len() < 9 {
-                    let eof = parse_eof_packet(&mut packet, sequence_id)?;
+                // Result-set terminator. With CLIENT_DEPRECATE_EOF this is an OK packet carrying
+                // a 0xFE header (affected_rows, last_insert_id, status, warnings, and a
+                // session-state blob when CLIENT_SESSION_TRACK is on); without it, a legacy EOF.
+                // Both are distinguished from a row whose first value is a 0xFE length-encoded
+                // integer by the payload length, not by `len() < 9` — that older test is only
+                // valid for legacy EOF and misroutes any terminator carrying session state into
+                // parse_result_row, which appends a garbage row and desyncs the connection.
+                //
+                // The proxy does not modify the terminator, so forward the original bytes and
+                // parse nothing: re-encoding it is what corrupted it (encode_ok hardcodes a 0x00
+                // header, so a 0xFE terminator could not survive a round trip).
+                if first_byte == 0xfe && payload_len < 0xffffff {
                     self.state = MySqlState::Command;
-                    return Ok(Some(MySqlMessage::Eof(eof)));
-                }
-
-                // OK packet (with CLIENT_DEPRECATE_EOF)
-                if first_byte == 0x00 && self.uses_deprecate_eof() {
-                    let ok = parse_ok_packet(&mut packet, sequence_id, self.capability_flags)?;
-                    self.state = MySqlState::Command;
-                    return Ok(Some(MySqlMessage::Ok(ok)));
+                    return Ok(Some(MySqlMessage::Generic(GenericPacket {
+                        sequence_id,
+                        payload: packet,
+                    })));
                 }
 
                 // ERR packet
