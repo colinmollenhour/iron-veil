@@ -430,10 +430,24 @@ impl AppState {
 
     /// Record a masking operation by strategy
     pub async fn record_masking(&self, strategy: &str) {
-        let mut stats = self.stats.write().await;
-        stats.masking.increment(strategy);
-        drop(stats);
-        metrics::record_fields_masked(1);
+        self.record_masking_batch(std::slice::from_ref(&strategy))
+            .await;
+    }
+
+    /// Record every masked field of a row under a single lock acquisition.
+    /// One process-global write lock per masked *field* serialized every
+    /// concurrent connection on the packet hot path.
+    pub async fn record_masking_batch(&self, strategies: &[&str]) {
+        if strategies.is_empty() {
+            return;
+        }
+        {
+            let mut stats = self.stats.write().await;
+            for strategy in strategies {
+                stats.masking.increment(strategy);
+            }
+        }
+        metrics::record_fields_masked(strategies.len() as u64);
     }
 
     /// Record a query by type (SELECT, INSERT, UPDATE, DELETE, etc.).

@@ -261,6 +261,13 @@ brute-forced without it.
   the wire and are matched by label only. Masking is best-effort by design;
   see the threat model note below.
 
+### Scanner Support
+
+The offline PII scanner (`POST /scan`, `POST /schema`, and the dashboard's
+Scan page) is **PostgreSQL-only**. Against a MySQL upstream both endpoints
+return `501 Not Implemented` with `"code": "unsupported_protocol"`. Runtime
+masking works on both protocols; only the offline schema inspection does not.
+
 ### Protocol Support
 
 IronVeil masks the **text protocol** only. MySQL server-side prepared

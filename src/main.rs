@@ -879,10 +879,24 @@ async fn process_postgres_connection(
     upstream_tls_config: Option<Arc<ClientConfig>>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    // Buffer the whole 8-byte prelude before routing. `peek` returns whatever
+    // is in the socket buffer at first readability, so a segmented client
+    // write used to skip the TLS-aware branch entirely and get an
+    // unconditional 'N' from the codec path — silently cleartext against a
+    // proxy the operator had configured for TLS.
     let mut buffer = [0u8; 8];
-    let n = tokio::time::timeout(HANDSHAKE_DEADLINE, client_socket.peek(&mut buffer))
-        .await
-        .map_err(|_| anyhow::anyhow!("client handshake timed out"))??;
+    let n = tokio::time::timeout(HANDSHAKE_DEADLINE, async {
+        loop {
+            let n = client_socket.peek(&mut buffer).await?;
+            if n >= 8 || n == 0 {
+                return Ok::<usize, std::io::Error>(n);
+            }
+            // Nothing else to wait on but more data arriving.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("client handshake timed out"))??;
     if n >= 8 {
         let len = u32::from_be_bytes(
             buffer[0..4]

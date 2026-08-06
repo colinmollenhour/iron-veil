@@ -46,10 +46,16 @@ multi-model audit and a black-box vetting run against MySQL 8.4.
 - `ironveil_binary_protocol_rejected_total` and
   `ironveil_copy_passthrough_total` metrics; Prometheus histograms now export
   `_bucket` series, fixing the shipped Grafana p95 panels.
-- `SECURITY.md`, `CONTRIBUTING.md`, this changelog, and a Security Posture
-  section in the README.
+- `SECURITY.md`, `CONTRIBUTING.md`, this changelog, and Security Posture,
+  Protocol Support and Scanner Support sections in the README (the offline
+  scanner is PostgreSQL-only; runtime masking covers both protocols).
 - `docker-compose.tls.yml` overlay; CI jobs for the dashboard, `cargo audit`
   and the end-to-end masking suite.
+
+### Changed
+
+- `serde_yaml` (archived upstream) replaced with `serde_yaml_ng`;
+  `thiserror` 1 → 2.
 
 ### Fixed
 
@@ -75,6 +81,13 @@ multi-model audit and a black-box vetting run against MySQL 8.4.
 - Dashboard: real numbers instead of fabricated tiles, error banners instead of
   silent empty states, health that fails to unknown rather than green, and
   `next` upgraded past the critical RCE advisory.
+- `ironveil_query_duration_seconds` measures the real query round trip
+  (PostgreSQL ReadyForQuery, MySQL result-set terminator) instead of an
+  in-memory lock acquisition, which read ~0 forever.
+- Masking stats are recorded once per row instead of once per masked field,
+  removing a process-global write lock from the packet hot path.
+- A segmented PostgreSQL startup prelude no longer skips the TLS-aware branch
+  and get an unconditional cleartext denial.
 - `release.sh` can no longer cut a release from a failing test run.
 - Integration probes detect a dead proxy instead of reporting it up.
 

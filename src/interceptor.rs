@@ -556,8 +556,9 @@ impl PacketInterceptor for Anonymizer {
             }
         }
 
-        for strat in &strategies_used {
-            self.state.record_masking(strat).await;
+        if !strategies_used.is_empty() {
+            let refs: Vec<&str> = strategies_used.iter().map(|s| s.as_str()).collect();
+            self.state.record_masking_batch(&refs).await;
         }
 
         if !changes_log.is_empty() {
@@ -697,8 +698,9 @@ impl MySqlPacketInterceptor for MySqlAnonymizer {
             }
         }
 
-        for strat in &strategies_used {
-            self.state.record_masking(strat).await;
+        if !strategies_used.is_empty() {
+            let refs: Vec<&str> = strategies_used.iter().map(|s| s.as_str()).collect();
+            self.state.record_masking_batch(&refs).await;
         }
 
         if !changes_log.is_empty() {
