@@ -207,6 +207,11 @@ pub struct ApiConfig {
     /// non-loopback address requires api_key or jwt_secret to be configured.
     #[serde(default)]
     pub bind: Option<String>,
+
+    /// Browser origins allowed to call the management API (CORS). Defaults to
+    /// the local dashboard dev origins when unset.
+    #[serde(default)]
+    pub cors_origins: Option<Vec<String>>,
 }
 
 /// Audit event types to log
@@ -221,7 +226,6 @@ pub enum AuditEventType {
     ConfigReload,
     DatabaseScan,
     SchemaQuery,
-    ApiAccess,
 }
 
 /// Configuration for audit logging
@@ -304,6 +308,9 @@ pub struct TelemetryConfig {
     pub otlp_endpoint: String,
     #[serde(default = "default_service_name")]
     pub service_name: String,
+    /// Trace sampling ratio in [0.0, 1.0] (default: 0.05).
+    #[serde(default)]
+    pub sample_ratio: Option<f64>,
 }
 
 fn default_otlp_endpoint() -> String {

@@ -164,6 +164,24 @@ pub struct EofPacket {
     pub raw: Bytes,
 }
 
+/// Build the 32-byte SSLRequest the proxy sends upstream before starting its
+/// own TLS handshake (sequence id 1, immediately after the server handshake).
+pub fn build_ssl_request(
+    capability_flags: u32,
+    max_packet_size: u32,
+    character_set: u8,
+) -> GenericPacket {
+    let mut payload = BytesMut::with_capacity(32);
+    payload.put_u32_le(capability_flags | CLIENT_SSL);
+    payload.put_u32_le(max_packet_size);
+    payload.put_u8(character_set);
+    payload.put_slice(&[0u8; 23]);
+    GenericPacket {
+        sequence_id: 1,
+        payload,
+    }
+}
+
 // Capability flags
 pub const CLIENT_SSL: u32 = 1 << 11;
 pub const CLIENT_COMPRESS: u32 = 1 << 5;
@@ -185,10 +203,6 @@ pub enum MySqlState {
     ReadingColumns { remaining: usize },
     /// Reading rows in result set
     ReadingRows,
-    /// Verbatim passthrough: every packet is surfaced as Generic. Used for
-    /// response streams the codec cannot model (binary protocol). Left only
-    /// via an explicit `set_command_state` from the proxy loop.
-    Passthrough,
 }
 
 /// Partially reassembled logical packet (payloads of exactly 0xFFFFFF bytes
@@ -230,6 +244,30 @@ impl MySqlCodec {
         }
     }
 
+    /// Client-facing codec resuming after a TLS upgrade: the handshake was
+    /// already sent in cleartext, so the next packet is the real response.
+    pub fn new_server_awaiting_handshake_response(capability_flags: u32) -> Self {
+        Self {
+            state: MySqlState::WaitingHandshakeResponse,
+            capability_flags,
+            is_client_side: false,
+            column_count: 0,
+            pending_large: None,
+        }
+    }
+
+    /// Upstream-facing codec resuming after a TLS upgrade: the server
+    /// handshake was already consumed, the auth exchange comes next.
+    pub fn new_client_awaiting_auth(capability_flags: u32) -> Self {
+        Self {
+            state: MySqlState::WaitingHandshakeResponse,
+            capability_flags,
+            is_client_side: true,
+            column_count: 0,
+            pending_large: None,
+        }
+    }
+
     /// Update capability flags after handshake
     pub fn set_capability_flags(&mut self, flags: u32) {
         self.capability_flags = flags;
@@ -239,11 +277,6 @@ impl MySqlCodec {
     /// every client command so a desynced response stream cannot persist).
     pub fn set_command_state(&mut self) {
         self.state = MySqlState::Command;
-    }
-
-    /// Enter verbatim passthrough until the next `set_command_state`.
-    pub fn set_passthrough_state(&mut self) {
-        self.state = MySqlState::Passthrough;
     }
 
     #[cfg(test)]
@@ -423,15 +456,15 @@ impl MySqlCodec {
 
                 // OK / ERR / legacy EOF: parsed for logging only, forwarded
                 // verbatim; a parse failure degrades to Generic passthrough.
-                if first_byte == 0x00 {
-                    if let Ok(ok) = parse_ok_packet(&packet, sequence_id, self.capability_flags) {
-                        return Ok(Some(MySqlMessage::Ok(ok)));
-                    }
+                if first_byte == 0x00
+                    && let Ok(ok) = parse_ok_packet(&packet, sequence_id, self.capability_flags)
+                {
+                    return Ok(Some(MySqlMessage::Ok(ok)));
                 }
-                if first_byte == 0xff {
-                    if let Ok(err) = parse_err_packet(&packet, sequence_id, self.capability_flags) {
-                        return Ok(Some(MySqlMessage::Err(err)));
-                    }
+                if first_byte == 0xff
+                    && let Ok(err) = parse_err_packet(&packet, sequence_id, self.capability_flags)
+                {
+                    return Ok(Some(MySqlMessage::Err(err)));
                 }
                 if first_byte == 0xfe
                     && packet.len() < 9
@@ -519,10 +552,6 @@ impl MySqlCodec {
                 let row = parse_result_row(&mut packet, sequence_id, self.column_count)?;
                 Ok(Some(MySqlMessage::ResultRow(row)))
             }
-            MySqlState::Passthrough => Ok(Some(MySqlMessage::Generic(GenericPacket {
-                sequence_id,
-                payload: packet,
-            }))),
         }
     }
 }
@@ -1557,8 +1586,10 @@ mod tests {
         let mut bytes = packet(&payload[..0xffffff], 4);
         bytes.extend_from_slice(&packet(&payload[0xffffff..], 5));
 
-        let mut codec = MySqlCodec::new_client();
-        codec.set_state_for_test(MySqlState::Passthrough);
+        // A server-side codec in the command phase surfaces a non-COM_QUERY
+        // payload as Generic, which is what we want to observe here.
+        let mut codec = MySqlCodec::new_server();
+        codec.set_state_for_test(MySqlState::Command);
         let MySqlMessage::Generic(g) = decode_one(&mut codec, &bytes) else {
             panic!("expected generic");
         };

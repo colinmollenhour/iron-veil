@@ -66,9 +66,19 @@ struct Args {
     #[arg(long, default_value = "proxy.yaml")]
     config: String,
 
+    /// Address the proxy listener binds to
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: std::net::IpAddr,
+
     /// Management API port
     #[arg(long, default_value_t = 3001)]
     api_port: u16,
+
+    /// Address the management API binds to (overrides api.bind from the
+    /// config file; defaults to 127.0.0.1). Binding a non-loopback address
+    /// requires api.api_key or api.jwt_secret.
+    #[arg(long)]
+    api_bind: Option<std::net::IpAddr>,
 
     /// Database protocol to proxy
     #[arg(long, value_enum, default_value_t = DbProtocol::Postgres)]
@@ -327,6 +337,30 @@ fn build_postgres_fatal_error_packet(sqlstate: &str, message: &str) -> Vec<u8> {
     packet
 }
 
+/// Build a FATAL ErrorResponse as a codec-level RegularMessage (for use on an
+/// already-framed connection, e.g. during graceful shutdown).
+fn build_postgres_fatal_regular_message(
+    sqlstate: &str,
+    message: &str,
+) -> crate::protocol::postgres::RegularMessage {
+    let mut payload = bytes::BytesMut::new();
+    for (key, value) in [
+        (b'S', "FATAL"),
+        (b'V', "FATAL"),
+        (b'C', sqlstate),
+        (b'M', message),
+    ] {
+        payload.put_u8(key);
+        payload.put_slice(value.as_bytes());
+        payload.put_u8(0);
+    }
+    payload.put_u8(0);
+    crate::protocol::postgres::RegularMessage {
+        message_type: b'E',
+        payload,
+    }
+}
+
 fn build_mysql_err_packet(error_code: u16, sql_state: &str, message: &str) -> Vec<u8> {
     let mut payload = Vec::with_capacity(1 + 2 + 1 + 5 + message.len());
     payload.push(0xFF);
@@ -380,16 +414,17 @@ where
     Ok(())
 }
 
-/// Background task that watches the config file for changes and reloads
+/// Background task that watches the config file for changes and reloads.
+/// The notify callback feeds a tokio channel: blocking recv on a std channel
+/// parked a runtime worker thread for seconds at a time.
 async fn run_config_watcher(state: AppState, config_path: String) {
     use std::path::Path;
-    use std::sync::mpsc::channel;
 
     let path = Path::new(&config_path);
     let parent = path.parent().unwrap_or(Path::new("."));
 
     // Create a channel to receive events
-    let (tx, rx) = channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Create a watcher with debounce
     let mut watcher: RecommendedWatcher = match Watcher::new(
@@ -428,40 +463,29 @@ async fn run_config_watcher(state: AppState, config_path: String) {
     let mut last_reload = Instant::now();
     let debounce_duration = Duration::from_secs(1);
 
-    loop {
-        // Check for events with a timeout
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(event) => {
-                // Check if this event is for our config file
-                let is_config_file = event.paths.iter().any(|p| {
-                    p.file_name()
-                        .and_then(|f| f.to_str())
-                        .map(|f| f == filename)
-                        .unwrap_or(false)
-                });
+    while let Some(event) = rx.recv().await {
+        // Check if this event is for our config file
+        let is_config_file = event.paths.iter().any(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .map(|f| f == filename)
+                .unwrap_or(false)
+        });
 
-                if is_config_file && last_reload.elapsed() > debounce_duration {
-                    info!("Config file changed, reloading...");
-                    match state.reload_config().await {
-                        Ok(rules_count) => {
-                            info!("Configuration reloaded: {} rules", rules_count);
-                        }
-                        Err(e) => {
-                            warn!("Failed to reload configuration: {}", e);
-                        }
-                    }
-                    last_reload = Instant::now();
+        if is_config_file && last_reload.elapsed() > debounce_duration {
+            info!("Config file changed, reloading...");
+            match state.reload_config().await {
+                Ok(rules_count) => {
+                    info!("Configuration reloaded: {} rules", rules_count);
+                }
+                Err(e) => {
+                    warn!("Failed to reload configuration: {}", e);
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // No events, continue watching
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn!("Config watcher channel disconnected, stopping watcher");
-                break;
-            }
+            last_reload = Instant::now();
         }
     }
+    warn!("Config watcher channel disconnected, stopping watcher");
 }
 
 #[tokio::main]
@@ -519,10 +543,22 @@ async fn main() -> Result<()> {
 
     // Start Management API in a separate task
     let api_port = args.api_port;
+    let api_bind = match args.api_bind {
+        Some(addr) => addr,
+        None => match config.api.as_ref().and_then(|a| a.bind.as_deref()) {
+            Some(bind) => bind
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid api.bind '{}': {}", bind, e))?,
+            None => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        },
+    };
     let api_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = api::start_api_server(api_port, api_state).await {
-            tracing::error!("API server error: {}", e);
+        if let Err(e) = api::start_api_server(api_bind, api_port, api_state).await {
+            // The API carries /health, /metrics and the masking control
+            // plane; running blind without it is worse than restarting.
+            tracing::error!("management API server failed: {}", e);
+            std::process::exit(1);
         }
     });
 
@@ -560,14 +596,32 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Starting DB Proxy on port {}", args.port);
+    info!("Starting DB Proxy on {}:{}", args.bind, args.port);
     info!(
         "Forwarding to upstream at {}:{}",
         args.upstream_host, args.upstream_port
     );
     info!("Protocol: {:?}", args.protocol);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", args.port)).await?;
+    // Loud rail: this proxy exists to protect PII, and with both TLS legs off
+    // it crosses the network in cleartext on both hops.
+    let client_tls_on = config.tls.as_ref().map(|t| t.enabled).unwrap_or(false);
+    if config.masking_enabled && !client_tls_on && !config.upstream_tls {
+        warn!(
+            "masking is enabled but both tls.enabled and upstream_tls are false: \
+             client and upstream traffic are cleartext. Acceptable only on a trusted network."
+        );
+    }
+
+    // Build the upstream TLS client config once: it loads the OS trust store,
+    // which is too expensive (and too panic-prone) for the per-connection path.
+    let upstream_tls_config = if config.upstream_tls {
+        Some(Arc::new(create_upstream_tls_config()?))
+    } else {
+        None
+    };
+
+    let listener = tokio::net::TcpListener::bind((args.bind, args.port)).await?;
     let protocol = args.protocol;
 
     // Create cancellation token for graceful shutdown
@@ -607,7 +661,18 @@ async fn main() -> Result<()> {
         tokio::select! {
             // Wait for new connection
             accept_result = listener.accept() => {
-                let (client_socket, client_addr) = accept_result?;
+                let (client_socket, client_addr) = match accept_result {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        // accept() returns transient errors (EMFILE/ENFILE on
+                        // fd exhaustion, ECONNABORTED, ENOBUFS); none of them
+                        // justify taking the whole proxy down.
+                        warn!("accept() failed: {}", e);
+                        metrics::record_connection_rejected("accept_error");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
 
                 // Rate limiting check
                 if let Some(max_rate) = rate_limit {
@@ -649,6 +714,8 @@ async fn main() -> Result<()> {
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let upstream_pool = upstream_pool.clone();
+                let upstream_tls_config = upstream_tls_config.clone();
+                let conn_cancel = cancel_token.child_token();
 
                 tokio::spawn(async move {
                     // Hold the permit for the duration of the connection
@@ -734,6 +801,8 @@ async fn main() -> Result<()> {
                                     state.clone(),
                                     tls_acceptor,
                                     upstream_pool.clone(),
+                                    upstream_tls_config,
+                                    conn_cancel,
                                 )
                                 .await
                             }
@@ -743,6 +812,9 @@ async fn main() -> Result<()> {
                                     upstream_host,
                                     upstream_port,
                                     state.clone(),
+                                    tls_acceptor,
+                                    upstream_tls_config,
+                                    conn_cancel,
                                 )
                                 .await
                             }
@@ -800,6 +872,12 @@ async fn main() -> Result<()> {
 // PostgreSQL Connection Handling
 // ============================================================================
 
+/// Deadline for the pre-protocol phase (startup peek, SSLRequest, TLS
+/// handshake): unauthenticated peers must not be able to pin a task and an fd
+/// by connecting and sending nothing.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
+
+#[allow(clippy::too_many_arguments)]
 async fn process_postgres_connection(
     mut client_socket: tokio::net::TcpStream,
     upstream_host: String,
@@ -807,9 +885,13 @@ async fn process_postgres_connection(
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
     upstream_pool: Option<UpstreamSlotManager>,
+    upstream_tls_config: Option<Arc<ClientConfig>>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let mut buffer = [0u8; 8];
-    let n = client_socket.peek(&mut buffer).await?;
+    let n = tokio::time::timeout(HANDSHAKE_DEADLINE, client_socket.peek(&mut buffer))
+        .await
+        .map_err(|_| anyhow::anyhow!("client handshake timed out"))??;
     if n >= 8 {
         let len = u32::from_be_bytes(
             buffer[0..4]
@@ -831,13 +913,18 @@ async fn process_postgres_connection(
                 info!("Received SSLRequest, accepting...");
                 client_socket.write_all(b"S").await?;
 
-                let tls_stream = acceptor.accept(client_socket).await?;
+                let tls_stream =
+                    tokio::time::timeout(HANDSHAKE_DEADLINE, acceptor.accept(client_socket))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("client TLS handshake timed out"))??;
                 return handle_postgres_protocol(
                     tls_stream,
                     upstream_host,
                     upstream_port,
                     state,
                     upstream_pool,
+                    upstream_tls_config,
+                    cancel,
                 )
                 .await;
             } else {
@@ -853,22 +940,27 @@ async fn process_postgres_connection(
         upstream_port,
         state,
         upstream_pool,
+        upstream_tls_config,
+        cancel,
     )
     .await
 }
 
 /// Creates a TLS ClientConfig that uses the OS native certificate verifier.
-pub fn create_upstream_tls_config() -> ClientConfig {
+pub fn create_upstream_tls_config() -> Result<ClientConfig> {
     // Initialize the platform-specific verifier
     let provider = Arc::new(default_provider());
-    let verifier = Arc::new(Verifier::new(provider).expect("Failed to create platform verifier"));
+    let verifier = Arc::new(
+        Verifier::new(provider)
+            .map_err(|e| anyhow::anyhow!("failed to create platform TLS verifier: {}", e))?,
+    );
 
-    ClientConfig::builder()
+    Ok(ClientConfig::builder()
         // .dangerous() is required because we are overriding the default
         // WebPki verifier with a custom one (the platform verifier).
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth()
+        .with_no_client_auth())
 }
 
 async fn handle_postgres_protocol<S>(
@@ -877,6 +969,8 @@ async fn handle_postgres_protocol<S>(
     upstream_port: u16,
     state: AppState,
     upstream_pool: Option<UpstreamSlotManager>,
+    upstream_tls_config: Option<Arc<ClientConfig>>,
+    cancel: CancellationToken,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -951,7 +1045,10 @@ where
             info!("Upstream accepted SSLRequest. Upgrading connection...");
 
             // 3. Upgrade to TLS
-            let client_config = Arc::new(create_upstream_tls_config());
+            let client_config = match upstream_tls_config {
+                Some(config) => config,
+                None => Arc::new(create_upstream_tls_config()?),
+            };
             let connector = TlsConnector::from(client_config);
 
             let domain = ServerName::try_from(upstream_host.as_str())
@@ -966,19 +1063,27 @@ where
                 upstream_tls_stream,
                 state,
                 idle_timeout,
+                cancel,
             )
             .await;
             return result;
         } else {
-            tracing::warn!(
-                "Upstream denied SSLRequest. Falling back to cleartext (or aborting if strict)."
-            );
-            // For now, we fall back to cleartext as per standard behavior, but you might want to enforce it.
+            // upstream_tls: true means required. Silently downgrading to
+            // cleartext turned a one-byte response (or an on-path rewrite)
+            // into credentials and unmasked data crossing the wire in plain.
+            let _ = send_postgres_fatal_error_response(
+                &mut client_socket,
+                "08006",
+                "upstream refused TLS but upstream_tls is required",
+            )
+            .await;
+            anyhow::bail!("upstream denied SSLRequest while upstream_tls is enabled");
         }
     }
 
     // Cleartext connection
-    handle_postgres_protocol_inner(client_socket, upstream_socket, state, idle_timeout).await
+    handle_postgres_protocol_inner(client_socket, upstream_socket, state, idle_timeout, cancel)
+        .await
 }
 
 async fn handle_postgres_protocol_inner<S, U>(
@@ -986,6 +1091,7 @@ async fn handle_postgres_protocol_inner<S, U>(
     upstream_socket: U,
     state: AppState,
     idle_timeout: Duration,
+    cancel: CancellationToken,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1079,14 +1185,25 @@ where
                                 if regular.message_type == b'Z' && !postgres_oid_bootstrap_done =>
                             {
                                 client_framed.send(PgMessage::Regular(regular)).await?;
-                                postgres_oid_bootstrap_done = true;
 
-                                match bootstrap_postgres_table_oid_map(&mut upstream_framed, &mut interceptor).await {
-                                    Ok(loaded) => {
-                                        info!("Loaded {} PostgreSQL table OID mappings for table-scoped rules", loaded);
-                                    }
-                                    Err(err) => {
-                                        warn!("Failed to bootstrap PostgreSQL table OID mappings: {}", err);
+                                let needs_bootstrap = {
+                                    let config = state.config.read().await;
+                                    !config.rules.is_empty()
+                                };
+                                if !needs_bootstrap {
+                                    postgres_oid_bootstrap_done = true;
+                                } else {
+                                    match bootstrap_postgres_table_oid_map(&mut upstream_framed, &mut interceptor).await {
+                                        Ok(loaded) => {
+                                            // Mark done only on success so a transient failure
+                                            // retries at the next ReadyForQuery instead of
+                                            // leaving table-scoped rules silently inert.
+                                            postgres_oid_bootstrap_done = true;
+                                            info!("Loaded {} PostgreSQL table/column mappings for rule matching", loaded);
+                                        }
+                                        Err(err) => {
+                                            warn!("Failed to bootstrap PostgreSQL OID mappings (will retry): {}", err);
+                                        }
                                     }
                                 }
                             }
@@ -1099,6 +1216,17 @@ where
                                 client_framed.send(PgMessage::DataRow(new_dr)).await?;
                             }
                             other => {
+                                // COPY TO STDOUT bypasses the DataRow interceptor entirely.
+                                // Make the unmasked path visible instead of silent.
+                                if let PgMessage::Regular(ref regular) = other
+                                    && regular.message_type == b'H'
+                                {
+                                    warn!(
+                                        "PostgreSQL COPY-out response forwarded without masking: \
+                                         COPY data does not pass through the row interceptor"
+                                    );
+                                    metrics::record_copy_passthrough();
+                                }
                                 client_framed.send(other).await?;
                             }
                         }
@@ -1106,6 +1234,15 @@ where
                     Some(Err(e)) => return Err(e),
                     None => return Ok(()), // Upstream disconnected
                 }
+            }
+            // Graceful shutdown
+            _ = cancel.cancelled() => {
+                info!("Shutdown requested; closing PostgreSQL connection");
+                let _ = client_framed.send(PgMessage::Regular(build_postgres_fatal_regular_message(
+                    "57P01",
+                    "proxy is shutting down",
+                ))).await;
+                return Ok(());
             }
             // Idle timeout
             _ = tokio::time::sleep(idle_timeout) => {
@@ -1132,11 +1269,15 @@ async fn bootstrap_postgres_table_oid_map<U>(
 where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Read all regular tables, partitions, views and foreign tables that appear in result sets.
+    // Read all regular tables, partitions, views and foreign tables that appear in result sets,
+    // including their column names/attnums so rules can match true provenance
+    // (table_oid + column_index) rather than the aliasable result-set label.
     const OID_LOOKUP_QUERY: &str = "
-        SELECT c.oid::text, n.nspname, c.relname
+        SELECT c.oid::text, n.nspname, c.relname, a.attnum::text, a.attname
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_attribute a
+          ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
         WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
     ";
@@ -1156,9 +1297,15 @@ where
                     .and_then(|raw| raw.parse::<u32>().ok());
                 let schema = decode_postgres_data_row_text_value(&row, 1);
                 let table = decode_postgres_data_row_text_value(&row, 2);
+                let attnum = decode_postgres_data_row_text_value(&row, 3)
+                    .and_then(|raw| raw.parse::<i16>().ok());
+                let column = decode_postgres_data_row_text_value(&row, 4);
 
                 if let (Some(oid), Some(schema), Some(table)) = (oid, schema, table) {
                     interceptor.register_postgres_table_oid(oid, &schema, &table);
+                    if let (Some(attnum), Some(column)) = (attnum, column) {
+                        interceptor.register_postgres_column(oid, attnum, &column);
+                    }
                     loaded += 1;
                 }
             }
@@ -1180,11 +1327,72 @@ where
 // MySQL Connection Handling
 // ============================================================================
 
+/// Any stream the proxy can run a protocol over. Boxing keeps the plain and
+/// TLS-wrapped variants of both legs from multiplying into a type explosion.
+trait ProxyStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ProxyStream for T {}
+type BoxedStream = Box<dyn ProxyStream + 'static>;
+
+/// A stream with bytes already read into a buffer put back in front of it.
+/// Framed may have buffered the client's TLS ClientHello together with the
+/// SSLRequest packet; those bytes must survive the switch to a TLS stream.
+struct PrefixedStream<S> {
+    prefix: bytes::BytesMut,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(prefix: bytes::BytesMut, inner: S) -> Self {
+        Self { prefix, inner }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if !this.prefix.is_empty() {
+            let n = this.prefix.len().min(buf.remaining());
+            buf.put_slice(&this.prefix.split_to(n));
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 async fn process_mysql_connection(
     client_socket: tokio::net::TcpStream,
     upstream_host: String,
     upstream_port: u16,
     state: AppState,
+    tls_acceptor: Option<TlsAcceptor>,
+    upstream_tls_config: Option<Arc<ClientConfig>>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     // Get timeout configuration
     let (connect_timeout, idle_timeout) = {
@@ -1197,19 +1405,35 @@ async fn process_mysql_connection(
     let upstream_socket =
         connect_upstream_with_timeout(&upstream_host, upstream_port, connect_timeout).await?;
 
-    handle_mysql_protocol(client_socket, upstream_socket, state, idle_timeout).await
+    handle_mysql_protocol(
+        Box::new(client_socket),
+        Box::new(upstream_socket),
+        upstream_host,
+        state,
+        idle_timeout,
+        tls_acceptor,
+        upstream_tls_config,
+        cancel,
+    )
+    .await
 }
 
-async fn handle_mysql_protocol<S, U>(
-    client_socket: S,
-    upstream_socket: U,
+#[allow(clippy::too_many_arguments)]
+async fn handle_mysql_protocol(
+    client_socket: BoxedStream,
+    upstream_socket: BoxedStream,
+    upstream_host: String,
     state: AppState,
     idle_timeout: Duration,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+    tls_acceptor: Option<TlsAcceptor>,
+    upstream_tls_config: Option<Arc<ClientConfig>>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let upstream_tls_required = {
+        let config = state.config.read().await;
+        config.upstream_tls
+    };
+
     let mut client_framed = Framed::new(client_socket, MySqlCodec::new_server());
     let mut upstream_framed = Framed::new(upstream_socket, MySqlCodec::new_client());
 
@@ -1220,14 +1444,18 @@ where
     let handshake = match upstream_framed.next().await {
         Some(Ok(MySqlMessage::Handshake(h))) => {
             info!(server_version = %h.server_version, "Received MySQL handshake from upstream");
-            // Advertise to the client only what this proxy can actually serve. Forwarding
-            // the upstream's CLIENT_SSL makes any TLS-preferring client (mysql 8.x and
-            // MySQL 8.4 defaults) attempt a TLS upgrade the proxy cannot answer; forwarding
-            // CLIENT_COMPRESS would produce a compressed stream the codec cannot frame.
-            // In both cases the masking layer would be bypassed or the connection dropped.
+            // Advertise to the client only what this proxy can actually serve:
+            // CLIENT_SSL only when a TLS acceptor is configured (otherwise a
+            // TLS-preferring client attempts an upgrade nothing answers), and
+            // never CLIENT_COMPRESS (the codec cannot frame a compressed
+            // stream, so masking would be bypassed).
             let mut client_handshake = h.clone();
-            client_handshake.capability_flags &=
-                !(crate::protocol::mysql::CLIENT_SSL | crate::protocol::mysql::CLIENT_COMPRESS);
+            client_handshake.capability_flags &= !crate::protocol::mysql::CLIENT_COMPRESS;
+            if tls_acceptor.is_some() {
+                client_handshake.capability_flags |= crate::protocol::mysql::CLIENT_SSL;
+            } else {
+                client_handshake.capability_flags &= !crate::protocol::mysql::CLIENT_SSL;
+            }
             client_framed
                 .send(MySqlMessage::Handshake(client_handshake))
                 .await?;
@@ -1249,21 +1477,12 @@ where
         .codec_mut()
         .set_capability_flags(handshake.capability_flags);
 
-    // Phase 2: Forward client handshake response to upstream
-    match client_framed.next().await {
-        Some(Ok(MySqlMessage::HandshakeResponse(r))) => {
-            info!(username = %r.username, database = ?r.database, "Received client handshake response");
-            // Update capability flags based on what client actually supports
-            client_framed
-                .codec_mut()
-                .set_capability_flags(r.capability_flags);
-            upstream_framed
-                .codec_mut()
-                .set_capability_flags(r.capability_flags);
-            upstream_framed
-                .send(MySqlMessage::HandshakeResponse(r))
-                .await?;
-        }
+    // Phase 2: client handshake response, upgrading to TLS if the client asks
+    let mut client_response = match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("client handshake response timed out"))?
+    {
+        Some(Ok(MySqlMessage::HandshakeResponse(r))) => r,
         Some(Ok(other)) => {
             tracing::warn!("Expected handshake response, got {:?}", other);
             return Err(anyhow::anyhow!(
@@ -1272,26 +1491,144 @@ where
         }
         Some(Err(e)) => return Err(e),
         None => return Ok(()),
+    };
+
+    if client_response.is_ssl_request() {
+        let Some(acceptor) = tls_acceptor else {
+            anyhow::bail!("client requested TLS but no TLS acceptor is configured");
+        };
+        let negotiated_caps = client_response.capability_flags;
+
+        // Re-wrap the client socket, carrying over anything Framed had already
+        // buffered past the SSLRequest packet.
+        let parts = client_framed.into_parts();
+        let prefixed = PrefixedStream::new(parts.read_buf, parts.io);
+        let tls_stream = tokio::time::timeout(HANDSHAKE_DEADLINE, acceptor.accept(prefixed))
+            .await
+            .map_err(|_| anyhow::anyhow!("client TLS handshake timed out"))??;
+        info!("MySQL client connection upgraded to TLS");
+
+        client_framed = Framed::new(
+            Box::new(tls_stream) as BoxedStream,
+            MySqlCodec::new_server_awaiting_handshake_response(negotiated_caps),
+        );
+
+        client_response = match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("client handshake response timed out after TLS"))?
+        {
+            Some(Ok(MySqlMessage::HandshakeResponse(r))) => r,
+            Some(Ok(other)) => {
+                anyhow::bail!("expected handshake response after TLS, got {:?}", other);
+            }
+            Some(Err(e)) => return Err(e),
+            None => return Ok(()),
+        };
     }
 
-    // Phase 3: Forward auth result
-    match upstream_framed.next().await {
-        Some(Ok(msg @ MySqlMessage::Ok(_))) => {
-            info!("MySQL authentication successful");
-            client_framed.send(msg).await?;
+    info!(username = %client_response.username, database = ?client_response.database,
+          "Received client handshake response");
+
+    // Upstream TLS leg. MySQL 8.4's default caching_sha2_password sends the
+    // password in cleartext during full auth and the server rejects that on an
+    // insecure connection, so a TLS-terminating proxy must re-originate TLS
+    // upstream for a non-cached credential to authenticate at all.
+    if upstream_tls_required {
+        if handshake.capability_flags & crate::protocol::mysql::CLIENT_SSL == 0 {
+            anyhow::bail!("upstream_tls is enabled but the upstream does not offer CLIENT_SSL");
         }
-        Some(Ok(MySqlMessage::Err(e))) => {
-            tracing::warn!(error_code = e.error_code, "MySQL authentication failed");
-            client_framed.send(MySqlMessage::Err(e)).await?;
-            return Ok(());
+        let ssl_request = crate::protocol::mysql::build_ssl_request(
+            client_response.capability_flags,
+            client_response.max_packet_size,
+            client_response.character_set,
+        );
+        upstream_framed
+            .send(MySqlMessage::Generic(ssl_request))
+            .await?;
+
+        let parts = upstream_framed.into_parts();
+        if !parts.read_buf.is_empty() {
+            anyhow::bail!("upstream sent data before the TLS handshake");
         }
-        Some(Ok(other)) => {
-            // Could be auth switch request or other auth packets - forward as-is
-            client_framed.send(other).await?;
-        }
-        Some(Err(e)) => return Err(e),
-        None => return Ok(()),
+        let client_config = match upstream_tls_config {
+            Some(config) => config,
+            None => Arc::new(create_upstream_tls_config()?),
+        };
+        let connector = TlsConnector::from(client_config);
+        let domain = ServerName::try_from(upstream_host.as_str())
+            .map_err(|_| anyhow::anyhow!("Invalid DNS name for upstream host"))?
+            .to_owned();
+        let tls_stream = connector.connect(domain, parts.io).await?;
+        info!("MySQL upstream connection upgraded to TLS");
+
+        upstream_framed = Framed::new(
+            Box::new(tls_stream) as BoxedStream,
+            MySqlCodec::new_client_awaiting_auth(client_response.capability_flags),
+        );
+    } else if client_response.capability_flags & crate::protocol::mysql::CLIENT_SSL != 0 {
+        warn!(
+            "client connected over TLS but upstream_tls is false: caching_sha2_password \
+             full authentication will fail for credentials the server has not cached"
+        );
     }
+
+    // Update capability flags based on what the client actually negotiated
+    client_framed
+        .codec_mut()
+        .set_capability_flags(client_response.capability_flags);
+    upstream_framed
+        .codec_mut()
+        .set_capability_flags(client_response.capability_flags);
+    upstream_framed
+        .send(MySqlMessage::HandshakeResponse(client_response))
+        .await?;
+
+    // Phase 3: relay the authentication exchange verbatim until it resolves.
+    // caching_sha2_password needs several round trips (auth switch, fast-auth
+    // result, public-key request, full auth); handling only one packet left
+    // every non-cached credential unable to connect.
+    let mut auth_rounds = 0;
+    loop {
+        auth_rounds += 1;
+        if auth_rounds > 20 {
+            anyhow::bail!("MySQL authentication exceeded 20 round trips");
+        }
+
+        match tokio::time::timeout(HANDSHAKE_DEADLINE, upstream_framed.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("upstream auth response timed out"))?
+        {
+            Some(Ok(msg @ MySqlMessage::Ok(_))) => {
+                info!("MySQL authentication successful");
+                client_framed.send(msg).await?;
+                break;
+            }
+            Some(Ok(MySqlMessage::Err(e))) => {
+                tracing::warn!(error_code = e.error_code, "MySQL authentication failed");
+                client_framed.send(MySqlMessage::Err(e)).await?;
+                return Ok(());
+            }
+            Some(Ok(other)) => {
+                // Auth switch request / auth more data: forward and relay the
+                // client's reply back upstream.
+                client_framed.send(other).await?;
+                match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("client auth response timed out"))?
+                {
+                    Some(Ok(reply)) => upstream_framed.send(reply).await?,
+                    Some(Err(e)) => return Err(e),
+                    None => return Ok(()),
+                }
+            }
+            Some(Err(e)) => return Err(e),
+            None => return Ok(()),
+        }
+    }
+
+    // Authentication is done; both codecs resume the command phase.
+    client_framed.codec_mut().set_command_state();
+    upstream_framed.codec_mut().set_command_state();
 
     // Phase 4: Command phase - bidirectional proxy with interception
     loop {
@@ -1385,6 +1722,18 @@ where
                     Some(Err(e)) => return Err(e),
                     None => return Ok(()),
                 }
+            }
+            // Graceful shutdown
+            _ = cancel.cancelled() => {
+                info!("Shutdown requested; closing MySQL connection");
+                let err = crate::protocol::mysql::ErrPacket::proxy_error(
+                    0,
+                    1053, // ER_SERVER_SHUTDOWN
+                    b"08S01",
+                    "proxy is shutting down",
+                );
+                let _ = client_framed.send(MySqlMessage::Err(err)).await;
+                return Ok(());
             }
             // Idle timeout
             _ = tokio::time::sleep(idle_timeout) => {

@@ -78,6 +78,11 @@ pub fn record_binary_protocol_rejected() {
     counter!("ironveil_binary_protocol_rejected_total").increment(1);
 }
 
+/// Record PostgreSQL COPY data forwarded without masking (unmasked path).
+pub fn record_copy_passthrough() {
+    counter!("ironveil_copy_passthrough_total").increment(1);
+}
+
 /// Record upstream health check
 pub fn record_health_check(healthy: bool, latency_ms: Option<u64>) {
     if let Some(latency) = latency_ms {
@@ -131,7 +136,10 @@ mod tests {
         let first = init_metrics();
         let second = init_metrics();
 
-        // Both handles should point to the same underlying registry.
-        assert_eq!(first.render(), second.render());
+        // Both handles must observe the same underlying registry. (Comparing
+        // two renders directly is racy: concurrent tests record metrics.)
+        super::record_masking_error();
+        assert!(first.render().contains("ironveil_masking_errors_total"));
+        assert!(second.render().contains("ironveil_masking_errors_total"));
     }
 }

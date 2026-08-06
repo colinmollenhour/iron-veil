@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use tokio::sync::RwLock;
 
@@ -21,8 +21,10 @@ pub struct LogEntry {
     pub details: Option<serde_json::Value>,
 }
 
-/// Upstream health status information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Upstream health status information.
+/// Defaults to unhealthy/unknown: reporting healthy before the first probe
+/// let CI gates and readiness probes pass against a dead upstream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub healthy: bool,
     pub last_check: Option<DateTime<Utc>>,
@@ -30,19 +32,6 @@ pub struct HealthStatus {
     pub consecutive_failures: u32,
     pub consecutive_successes: u32,
     pub latency_ms: Option<u64>,
-}
-
-impl Default for HealthStatus {
-    fn default() -> Self {
-        Self {
-            healthy: true, // Assume healthy until proven otherwise
-            last_check: None,
-            last_error: None,
-            consecutive_failures: 0,
-            consecutive_successes: 0,
-            latency_ms: None,
-        }
-    }
 }
 
 /// Database protocol type for upstream connection
@@ -156,7 +145,6 @@ pub struct AppState {
     pub config_path: Arc<String>,
     pub active_connections: Arc<AtomicUsize>,
     pub logs: Arc<RwLock<VecDeque<LogEntry>>>,
-    pub upstream_healthy: Arc<AtomicBool>,
     pub health_status: Arc<RwLock<HealthStatus>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
     /// Upstream database host for scanning
@@ -174,6 +162,45 @@ pub struct AppState {
     /// Key for the deterministic masking functions. Derived from
     /// `masking_secret` when configured, otherwise random per process.
     masking_key: Arc<std::sync::RwLock<[u8; 32]>>,
+}
+
+fn to_audit_config(cfg: &crate::config::AuditConfig) -> crate::audit::AuditConfig {
+    crate::audit::AuditConfig {
+        enabled: cfg.enabled,
+        log_to_stdout: cfg.log_to_stdout,
+        log_file: cfg.log_file.clone(),
+        rotation_enabled: cfg.rotation_enabled,
+        max_file_size_bytes: cfg.max_file_size_bytes,
+        max_rotated_files: cfg.max_rotated_files,
+        events: cfg
+            .events
+            .iter()
+            .map(|e| match e {
+                crate::config::AuditEventType::AuthAttempt => {
+                    crate::audit::AuditEventType::AuthAttempt
+                }
+                crate::config::AuditEventType::ConfigChange => {
+                    crate::audit::AuditEventType::ConfigChange
+                }
+                crate::config::AuditEventType::RuleAdded => crate::audit::AuditEventType::RuleAdded,
+                crate::config::AuditEventType::RuleDeleted => {
+                    crate::audit::AuditEventType::RuleDeleted
+                }
+                crate::config::AuditEventType::RulesImported => {
+                    crate::audit::AuditEventType::RulesImported
+                }
+                crate::config::AuditEventType::ConfigReload => {
+                    crate::audit::AuditEventType::ConfigReload
+                }
+                crate::config::AuditEventType::DatabaseScan => {
+                    crate::audit::AuditEventType::DatabaseScan
+                }
+                crate::config::AuditEventType::SchemaQuery => {
+                    crate::audit::AuditEventType::SchemaQuery
+                }
+            })
+            .collect(),
+    }
 }
 
 fn derive_masking_key(secret: Option<&str>) -> [u8; 32] {
@@ -199,53 +226,13 @@ impl AppState {
         db_protocol: DbProtocol,
     ) -> Self {
         // Create audit logger from config
-        let audit_logger = config
-            .audit
-            .as_ref()
-            .map(|cfg| {
-                AuditLogger::new(crate::audit::AuditConfig {
-                    enabled: cfg.enabled,
-                    log_to_stdout: cfg.log_to_stdout,
-                    log_file: cfg.log_file.clone(),
-                    rotation_enabled: cfg.rotation_enabled,
-                    max_file_size_bytes: cfg.max_file_size_bytes,
-                    max_rotated_files: cfg.max_rotated_files,
-                    events: cfg
-                        .events
-                        .iter()
-                        .map(|e| match e {
-                            crate::config::AuditEventType::AuthAttempt => {
-                                crate::audit::AuditEventType::AuthAttempt
-                            }
-                            crate::config::AuditEventType::ConfigChange => {
-                                crate::audit::AuditEventType::ConfigChange
-                            }
-                            crate::config::AuditEventType::RuleAdded => {
-                                crate::audit::AuditEventType::RuleAdded
-                            }
-                            crate::config::AuditEventType::RuleDeleted => {
-                                crate::audit::AuditEventType::RuleDeleted
-                            }
-                            crate::config::AuditEventType::RulesImported => {
-                                crate::audit::AuditEventType::RulesImported
-                            }
-                            crate::config::AuditEventType::ConfigReload => {
-                                crate::audit::AuditEventType::ConfigReload
-                            }
-                            crate::config::AuditEventType::DatabaseScan => {
-                                crate::audit::AuditEventType::DatabaseScan
-                            }
-                            crate::config::AuditEventType::SchemaQuery => {
-                                crate::audit::AuditEventType::SchemaQuery
-                            }
-                            crate::config::AuditEventType::ApiAccess => {
-                                crate::audit::AuditEventType::ApiAccess
-                            }
-                        })
-                        .collect(),
-                })
-            })
-            .unwrap_or_else(|| AuditLogger::new(crate::audit::AuditConfig::default()));
+        let audit_logger = AuditLogger::new(
+            config
+                .audit
+                .as_ref()
+                .map(to_audit_config)
+                .unwrap_or_default(),
+        );
 
         let masking_key = derive_masking_key(config.masking_secret.as_deref());
 
@@ -254,7 +241,6 @@ impl AppState {
             config_path: Arc::new(config_path),
             active_connections: Arc::new(AtomicUsize::new(0)),
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
-            upstream_healthy: Arc::new(AtomicBool::new(true)),
             health_status: Arc::new(RwLock::new(HealthStatus::default())),
             metrics_handle: None,
             upstream_host: Arc::new(upstream_host),
@@ -292,12 +278,24 @@ impl AppState {
         self
     }
 
-    /// Save current config to the config file
-    pub async fn save_config(&self) -> Result<(), std::io::Error> {
-        let config = self.config.read().await;
-        let yaml = serde_yaml::to_string(&*config)
+    /// Atomically persist a new config, then swap it into live state.
+    /// Live state is untouched when persistence fails, so the on-disk policy
+    /// can never silently diverge from runtime behaviour.
+    pub async fn commit_config(&self, new_config: AppConfig) -> Result<(), std::io::Error> {
+        let yaml = serde_yaml::to_string(&new_config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&*self.config_path, yaml)
+        let path = self.config_path.as_ref().clone();
+        tokio::task::spawn_blocking(move || {
+            let tmp = format!("{}.tmp", path);
+            std::fs::write(&tmp, yaml)?;
+            std::fs::rename(&tmp, &path)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+
+        let mut config = self.config.write().await;
+        *config = new_config;
+        Ok(())
     }
 
     pub async fn add_log(&self, entry: LogEntry) {
@@ -340,10 +338,8 @@ impl AppState {
         // Update healthy status based on thresholds
         if status.consecutive_failures >= unhealthy_threshold {
             status.healthy = false;
-            self.upstream_healthy.store(false, Ordering::Relaxed);
         } else if status.consecutive_successes >= healthy_threshold {
             status.healthy = true;
-            self.upstream_healthy.store(true, Ordering::Relaxed);
         }
     }
 
@@ -369,6 +365,53 @@ impl AppState {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *key = new_key;
+        }
+
+        // Re-apply the reloadable audit section; warn about sections that
+        // only take effect after a restart so a reload cannot silently claim
+        // to have applied them.
+        self.audit_logger
+            .apply_config(
+                new_config
+                    .audit
+                    .as_ref()
+                    .map(to_audit_config)
+                    .unwrap_or_default(),
+            )
+            .await;
+
+        {
+            let current = self.config.read().await;
+            let mut restart_required = Vec::new();
+            if serde_yaml::to_string(&current.tls).ok()
+                != serde_yaml::to_string(&new_config.tls).ok()
+            {
+                restart_required.push("tls");
+            }
+            if current.upstream_tls != new_config.upstream_tls {
+                restart_required.push("upstream_tls");
+            }
+            if serde_yaml::to_string(&current.limits).ok()
+                != serde_yaml::to_string(&new_config.limits).ok()
+            {
+                restart_required.push("limits");
+            }
+            if serde_yaml::to_string(&current.telemetry).ok()
+                != serde_yaml::to_string(&new_config.telemetry).ok()
+            {
+                restart_required.push("telemetry");
+            }
+            if serde_yaml::to_string(&current.api).ok()
+                != serde_yaml::to_string(&new_config.api).ok()
+            {
+                restart_required.push("api");
+            }
+            if !restart_required.is_empty() {
+                tracing::warn!(
+                    sections = ?restart_required,
+                    "reloaded config changes sections that only take effect after a restart"
+                );
+            }
         }
 
         // Update the config
