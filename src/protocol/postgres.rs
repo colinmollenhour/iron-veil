@@ -71,6 +71,12 @@ pub struct PostgresCodec {
     is_startup: bool,
 }
 
+impl Default for PostgresCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PostgresCodec {
     pub fn new() -> Self {
         Self { is_startup: true }

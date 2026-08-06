@@ -6,16 +6,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
 
-mod api;
-mod audit;
-mod config;
-mod db_scanner;
-mod interceptor;
-mod metrics;
-mod protocol;
-mod scanner;
-mod state;
-mod telemetry;
+use iron_veil::{api, config, interceptor, metrics, protocol, state, telemetry};
 
 use crate::config::AppConfig;
 use crate::interceptor::{Anonymizer, MySqlAnonymizer, MySqlPacketInterceptor, PacketInterceptor};

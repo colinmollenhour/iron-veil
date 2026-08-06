@@ -76,14 +76,19 @@ async fn ensure_proxy_running(test_name: &str) -> bool {
     false
 }
 
-/// Helper to check if the proxy is running
+/// Helper to check if the proxy is running.
+/// `timeout(..).await.is_ok()` was true for a *refused* connection
+/// (Ok(Err(ConnectionRefused))), so strict mode never fired and CI passed
+/// against a proxy that had never started.
 async fn is_proxy_running() -> bool {
-    timeout(
-        CONNECTION_TIMEOUT,
-        TcpStream::connect(format!("{}:{}", PROXY_HOST, PROXY_PORT)),
+    matches!(
+        timeout(
+            CONNECTION_TIMEOUT,
+            TcpStream::connect(format!("{}:{}", PROXY_HOST, PROXY_PORT)),
+        )
+        .await,
+        Ok(Ok(_))
     )
-    .await
-    .is_ok()
 }
 
 /// Helper to check if API is running
@@ -326,53 +331,37 @@ mod postgres_tests {
             return;
         }
 
-        let mut stream = match timeout(
+        // Past this point the proxy answered a TCP connect, so a failure is
+        // a real defect: fail rather than skip.
+        let mut stream = timeout(
             CONNECTION_TIMEOUT,
             TcpStream::connect(format!("{}:{}", PROXY_HOST, PROXY_PORT)),
         )
         .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                eprintln!("Failed to connect to proxy: {}", e);
-                return;
-            }
-            Err(_) => {
-                eprintln!("Connection timeout");
-                return;
-            }
-        };
+        .expect("connection to a live proxy timed out")
+        .expect("connection to a live proxy failed");
 
         // Send startup message
         let startup = build_startup_message("postgres", "postgres");
-        if let Err(e) = stream.write_all(&startup).await {
-            eprintln!("Failed to send startup message: {}", e);
-            return;
-        }
+        stream
+            .write_all(&startup)
+            .await
+            .expect("failed to send startup message");
 
         // Read response (should get authentication request or error)
         let mut buf = [0u8; 1024];
-        match timeout(CONNECTION_TIMEOUT, stream.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                // We got a response - the proxy is working
-                // First byte indicates message type
-                let msg_type = buf[0] as char;
-                assert!(
-                    msg_type == 'R' || msg_type == 'E' || msg_type == 'S',
-                    "Should receive Authentication (R), Error (E), or SSL (S) response, got: {}",
-                    msg_type
-                );
-            }
-            Ok(Ok(_)) => {
-                eprintln!("Connection closed by proxy (0 bytes read)");
-            }
-            Ok(Err(e)) => {
-                eprintln!("Failed to read response: {}", e);
-            }
-            Err(_) => {
-                eprintln!("Read timeout");
-            }
-        }
+        let n = timeout(CONNECTION_TIMEOUT, stream.read(&mut buf))
+            .await
+            .expect("read from a live proxy timed out")
+            .expect("read from a live proxy failed");
+        assert!(n > 0, "proxy closed the connection without responding");
+
+        let msg_type = buf[0] as char;
+        assert!(
+            msg_type == 'R' || msg_type == 'E' || msg_type == 'S',
+            "Should receive Authentication (R), Error (E), or SSL (S) response, got: {}",
+            msg_type
+        );
     }
 
     /// Test SSL request handling
@@ -382,15 +371,13 @@ mod postgres_tests {
             return;
         }
 
-        let mut stream = match timeout(
+        let mut stream = timeout(
             CONNECTION_TIMEOUT,
             TcpStream::connect(format!("{}:{}", PROXY_HOST, PROXY_PORT)),
         )
         .await
-        {
-            Ok(Ok(s)) => s,
-            _ => return,
-        };
+        .expect("connection to a live proxy timed out")
+        .expect("connection to a live proxy failed");
 
         // Send SSL request (8 bytes: length 8 + SSL code 80877103)
         let ssl_request = [
@@ -398,26 +385,25 @@ mod postgres_tests {
             0x04, 0xd2, 0x16, 0x2f, // SSL request code: 80877103
         ];
 
-        if let Err(e) = stream.write_all(&ssl_request).await {
-            eprintln!("Failed to send SSL request: {}", e);
-            return;
-        }
+        stream
+            .write_all(&ssl_request)
+            .await
+            .expect("failed to send SSL request");
 
         // Read response (should be 'S' for SSL supported or 'N' for not supported)
         let mut buf = [0u8; 1];
-        match timeout(CONNECTION_TIMEOUT, stream.read(&mut buf)).await {
-            Ok(Ok(1)) => {
-                let response = buf[0] as char;
-                assert!(
-                    response == 'S' || response == 'N',
-                    "SSL response should be 'S' or 'N', got: {}",
-                    response
-                );
-            }
-            _ => {
-                eprintln!("Failed to read SSL response");
-            }
-        }
+        let n = timeout(CONNECTION_TIMEOUT, stream.read(&mut buf))
+            .await
+            .expect("SSL response timed out")
+            .expect("failed to read SSL response");
+        assert_eq!(n, 1, "expected a one-byte SSL response");
+
+        let response = buf[0] as char;
+        assert!(
+            response == 'S' || response == 'N',
+            "SSL response should be 'S' or 'N', got: {}",
+            response
+        );
     }
 
     /// Test connection rejection when upstream is unavailable
@@ -464,12 +450,14 @@ mod mysql_tests {
     const MYSQL_PROXY_PORT: u16 = 3307; // Default MySQL proxy port
 
     async fn is_mysql_proxy_running() -> bool {
-        timeout(
-            CONNECTION_TIMEOUT,
-            TcpStream::connect(format!("{}:{}", PROXY_HOST, MYSQL_PROXY_PORT)),
+        matches!(
+            timeout(
+                CONNECTION_TIMEOUT,
+                TcpStream::connect(format!("{}:{}", PROXY_HOST, MYSQL_PROXY_PORT)),
+            )
+            .await,
+            Ok(Ok(_))
         )
-        .await
-        .is_ok()
     }
 
     /// Test MySQL proxy connection (if MySQL mode is running)
@@ -489,211 +477,116 @@ mod mysql_tests {
             return;
         }
 
-        let mut stream = match timeout(
+        let mut stream = timeout(
             CONNECTION_TIMEOUT,
             TcpStream::connect(format!("{}:{}", PROXY_HOST, MYSQL_PROXY_PORT)),
         )
         .await
-        {
-            Ok(Ok(s)) => s,
-            _ => return,
-        };
+        .expect("connection to a live MySQL proxy timed out")
+        .expect("connection to a live MySQL proxy failed");
 
         // MySQL server should send initial handshake packet
         let mut buf = [0u8; 1024];
-        match timeout(CONNECTION_TIMEOUT, stream.read(&mut buf)).await {
-            Ok(Ok(n)) if n >= 4 => {
-                // MySQL packet header: 3 bytes length + 1 byte sequence
-                let length = (buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16);
-                let sequence = buf[3];
+        let n = timeout(CONNECTION_TIMEOUT, stream.read(&mut buf))
+            .await
+            .expect("MySQL handshake read timed out")
+            .expect("MySQL handshake read failed");
+        assert!(
+            n >= 5,
+            "MySQL handshake should be at least 5 bytes, got {n}"
+        );
 
-                assert!(length > 0, "MySQL handshake packet should have content");
-                assert_eq!(sequence, 0, "Initial handshake should have sequence 0");
-
-                // Protocol version should be 10 (0x0a)
-                if n > 4 {
-                    assert_eq!(
-                        buf[4], 10,
-                        "MySQL protocol version should be 10, got: {}",
-                        buf[4]
-                    );
-                }
-            }
-            _ => {
-                eprintln!("Received too few bytes or failed to read MySQL handshake");
-            }
-        }
+        // MySQL packet header: 3 bytes length + 1 byte sequence
+        let length = (buf[0] as u32) | ((buf[1] as u32) << 8) | ((buf[2] as u32) << 16);
+        assert!(length > 0, "MySQL handshake packet should have content");
+        assert_eq!(buf[3], 0, "Initial handshake should have sequence 0");
+        assert_eq!(
+            buf[4], 10,
+            "MySQL protocol version should be 10, got: {}",
+            buf[4]
+        );
     }
 }
 
-mod masking_tests {
-    /// Test that email patterns are detected correctly
+// The previous `masking_tests` and `protocol_tests` modules asserted against
+// inline regexes and hand-rolled byte arithmetic that had already drifted from
+// production (their credit-card test accepted a 15-digit Amex the shipped
+// scanner rejected). They are replaced here with tests that drive the real
+// scanner and codecs through the library crate.
+mod scanner_tests {
+    use iron_veil::scanner::{PiiScanner, PiiType};
+
     #[test]
-    fn test_email_detection_pattern() {
-        let patterns = [
-            ("test@example.com", true),
-            ("user.name@domain.org", true),
-            ("invalid-email", false),
-            ("@nodomain.com", false),
-            ("noat.domain.com", false),
-        ];
+    fn test_real_scanner_detects_expected_types() {
+        let scanner = PiiScanner::shared();
 
-        let email_regex =
-            regex::Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$").unwrap();
+        assert_eq!(scanner.scan("test@example.com"), Some(PiiType::Email));
+        assert_eq!(scanner.scan("123-45-6789"), Some(PiiType::Ssn));
+        assert_eq!(scanner.scan("+1-555-123-4567"), Some(PiiType::Phone));
+        assert_eq!(scanner.scan("192.168.1.1"), Some(PiiType::IpAddress));
+        assert_eq!(scanner.scan("1990-01-15"), Some(PiiType::DateOfBirth));
+        // Luhn-valid Visa and Amex
+        assert_eq!(scanner.scan("4532015112830366"), Some(PiiType::CreditCard));
+        assert_eq!(scanner.scan("378282246310005"), Some(PiiType::CreditCard));
 
-        for (input, expected) in patterns {
-            let result = email_regex.is_match(input);
-            assert_eq!(
-                result, expected,
-                "Email detection failed for '{}': expected {}, got {}",
-                input, expected, result
-            );
-        }
-    }
-
-    /// Test credit card pattern detection
-    #[test]
-    fn test_credit_card_detection_pattern() {
-        let patterns = [
-            ("4111111111111111", true),  // Visa test number
-            ("5500000000000004", true),  // Mastercard test
-            ("378282246310005", true),   // Amex test
-            ("1234", false),             // Too short
-            ("abcd1234abcd1234", false), // Contains letters
-        ];
-
-        let cc_regex = regex::Regex::new(r"^\d{13,19}$").unwrap();
-
-        for (input, expected) in patterns {
-            let result = cc_regex.is_match(input);
-            assert_eq!(
-                result, expected,
-                "Credit card detection failed for '{}': expected {}, got {}",
-                input, expected, result
-            );
-        }
-    }
-
-    /// Test SSN pattern detection
-    #[test]
-    fn test_ssn_detection_pattern() {
-        let patterns = [
-            ("123-45-6789", true),
-            ("000-00-0000", true),
-            ("12345-6789", false),
-            ("123-456-789", false),
-            ("1234567890", false),
-        ];
-
-        let ssn_regex = regex::Regex::new(r"^\d{3}-\d{2}-\d{4}$").unwrap();
-
-        for (input, expected) in patterns {
-            let result = ssn_regex.is_match(input);
-            assert_eq!(
-                result, expected,
-                "SSN detection failed for '{}': expected {}, got {}",
-                input, expected, result
-            );
-        }
-    }
-
-    /// Test IP address detection
-    #[test]
-    fn test_ip_address_detection_pattern() {
-        let patterns = [
-            ("192.168.1.1", true),
-            ("10.0.0.255", true),
-            ("256.1.1.1", true), // Regex doesn't validate range
-            ("1.2.3", false),
-            ("1.2.3.4.5", false),
-        ];
-
-        let ip_regex = regex::Regex::new(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$").unwrap();
-
-        for (input, expected) in patterns {
-            let result = ip_regex.is_match(input);
-            assert_eq!(
-                result, expected,
-                "IP detection failed for '{}': expected {}, got {}",
-                input, expected, result
-            );
-        }
-    }
-
-    /// Test phone number detection
-    #[test]
-    fn test_phone_detection_pattern() {
-        let patterns = [
-            ("+1-555-123-4567", true),
-            ("+1 (555) 123-4567", true),
-            ("+44 20 7123 4567", true),
-            ("123-4567", false), // Too short, no country code
-        ];
-
-        // Phone regex that requires country code prefix
-        let phone_regex =
-            regex::Regex::new(r"^\+\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}$")
-                .unwrap();
-
-        for (input, expected) in patterns {
-            let result = phone_regex.is_match(input);
-            assert_eq!(
-                result, expected,
-                "Phone detection failed for '{}': expected {}, got {}",
-                input, expected, result
-            );
-        }
+        // Non-PII must survive untouched
+        assert_eq!(scanner.scan("not-an-email"), None);
+        assert_eq!(scanner.scan("John Doe"), None);
+        // A Luhn-failing 16-digit identifier is an order number, not a card
+        assert_eq!(scanner.scan("1234567890123456"), None);
     }
 }
 
-mod protocol_tests {
-    /// Test PostgreSQL message parsing
+mod codec_tests {
+    use bytes::BytesMut;
+    use iron_veil::protocol::mysql::{MySqlCodec, MySqlMessage};
+    use iron_veil::protocol::postgres::{PgMessage, PostgresCodec};
+    use tokio_util::codec::Decoder;
+
     #[test]
-    fn test_postgres_message_length_calculation() {
-        // PostgreSQL message format: Type (1 byte) + Length (4 bytes) + Payload
-        // Length includes itself but NOT the type byte
+    fn test_postgres_codec_decodes_a_real_query() {
+        let payload = b"SELECT 1\0";
+        let mut src = BytesMut::new();
+        src.extend_from_slice(b"Q");
+        src.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        src.extend_from_slice(payload);
 
-        let payload = b"SELECT 1";
-        let msg_type: u8 = b'Q'; // Query message
-
-        // Total length = 4 (length field) + payload.len()
-        let total_length: u32 = 4 + payload.len() as u32;
-
-        let mut message = Vec::new();
-        message.push(msg_type);
-        message.extend_from_slice(&total_length.to_be_bytes());
-        message.extend_from_slice(payload);
-
-        // Verify message structure
-        assert_eq!(message[0], b'Q');
-        let parsed_length = u32::from_be_bytes([message[1], message[2], message[3], message[4]]);
-        assert_eq!(parsed_length, 12); // 4 + 8 = 12
+        let mut codec = PostgresCodec::new_upstream();
+        let msg = codec.decode(&mut src).unwrap().unwrap();
+        match msg {
+            PgMessage::Query(q) => assert_eq!(&q.query[..], b"SELECT 1"),
+            other => panic!("expected Query, got {:?}", other),
+        }
     }
 
-    /// Test MySQL packet length calculation
     #[test]
-    fn test_mysql_packet_length_calculation() {
-        // MySQL packet format: Length (3 bytes LE) + Sequence (1 byte) + Payload
+    fn test_postgres_codec_rejects_an_oversized_frame() {
+        // Four bytes of 0xFF used to force a ~4 GiB reservation pre-auth.
+        let mut src = BytesMut::new();
+        src.extend_from_slice(b"Q");
+        src.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut codec = PostgresCodec::new_upstream();
+        assert!(codec.decode(&mut src).is_err());
+    }
 
-        let payload = b"SELECT 1";
-        let sequence: u8 = 0;
+    #[test]
+    fn test_mysql_codec_decodes_a_real_com_query() {
+        let mut payload = vec![0x03];
+        payload.extend_from_slice(b"SELECT email FROM users");
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&[
+            (payload.len() & 0xff) as u8,
+            ((payload.len() >> 8) & 0xff) as u8,
+            ((payload.len() >> 16) & 0xff) as u8,
+            0,
+        ]);
+        src.extend_from_slice(&payload);
 
-        let length = payload.len() as u32;
-        let length_bytes = [
-            (length & 0xFF) as u8,
-            ((length >> 8) & 0xFF) as u8,
-            ((length >> 16) & 0xFF) as u8,
-        ];
-
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&length_bytes);
-        packet.push(sequence);
-        packet.extend_from_slice(payload);
-
-        // Verify packet structure
-        let parsed_length =
-            (packet[0] as u32) | ((packet[1] as u32) << 8) | ((packet[2] as u32) << 16);
-        assert_eq!(parsed_length, 8);
-        assert_eq!(packet[3], 0); // sequence
+        let mut codec = MySqlCodec::new_server_awaiting_command();
+        let msg = codec.decode(&mut src).unwrap().unwrap();
+        match msg {
+            MySqlMessage::Query(q) => assert_eq!(&q.query[..], b"SELECT email FROM users"),
+            other => panic!("expected Query, got {:?}", other),
+        }
     }
 }

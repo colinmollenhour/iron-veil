@@ -200,6 +200,26 @@ async fn api_auth(
         .into_response()
 }
 
+/// The authenticated half of the management API. Extracted so tests can drive
+/// the real router (and therefore the real auth middleware) rather than
+/// calling handlers directly and bypassing authorization entirely.
+fn protected_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/rules", get(get_rules).post(add_rule))
+        .route("/rules/delete", post(delete_rule))
+        .route("/rules/export", get(export_rules))
+        .route("/rules/import", post(import_rules))
+        .route("/config", get(get_config).post(update_config))
+        .route("/config/reload", post(reload_config))
+        .route("/scan", post(scan_database))
+        .route("/connections", get(get_connections))
+        .route("/stats", get(get_stats))
+        .route("/schema", post(get_schema))
+        .route("/logs", get(get_logs))
+        .route("/audit", get(get_audit_logs))
+        .layer(middleware::from_fn_with_state(state, api_auth))
+}
+
 pub async fn start_api_server(bind: IpAddr, port: u16, state: AppState) -> anyhow::Result<()> {
     let (has_credentials, cors_origins) = {
         let config = state.config.read().await;
@@ -238,20 +258,7 @@ pub async fn start_api_server(bind: IpAddr, port: u16, state: AppState) -> anyho
         .route("/metrics", get(get_metrics));
 
     // Protected routes (require API key or JWT if configured)
-    let protected_routes = Router::new()
-        .route("/rules", get(get_rules).post(add_rule))
-        .route("/rules/delete", post(delete_rule))
-        .route("/rules/export", get(export_rules))
-        .route("/rules/import", post(import_rules))
-        .route("/config", get(get_config).post(update_config))
-        .route("/config/reload", post(reload_config))
-        .route("/scan", post(scan_database))
-        .route("/connections", get(get_connections))
-        .route("/stats", get(get_stats))
-        .route("/schema", post(get_schema))
-        .route("/logs", get(get_logs))
-        .route("/audit", get(get_audit_logs))
-        .layer(middleware::from_fn_with_state(state.clone(), api_auth));
+    let protected_routes = protected_router(state.clone());
 
     // Explicit CORS allow-list: a permissive layer let any web page a
     // browser on the network visits drive the management API cross-origin.
@@ -1586,5 +1593,167 @@ mod tests {
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ------------------------------------------------------------------
+    // api_auth middleware. These drive the real protected router through
+    // tower::ServiceExt::oneshot; calling handlers directly (as the rest of
+    // this module does) bypasses authorization entirely, which is why the
+    // highest-consequence path in the product had no coverage.
+    // ------------------------------------------------------------------
+
+    fn auth_test_state(api: Option<ApiConfig>) -> AppState {
+        AppState::new_for_test(
+            AppConfig {
+                api,
+                ..Default::default()
+            },
+            "proxy.yaml".to_string(),
+        )
+    }
+
+    async fn auth_request(state: AppState, headers: Vec<(&str, String)>) -> StatusCode {
+        use tower::ServiceExt;
+
+        let app = protected_router(state.clone()).with_state(state);
+        let mut builder = Request::builder().uri("/rules").method("GET");
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 50000))));
+
+        app.oneshot(request).await.unwrap().status()
+    }
+
+    fn jwt_for(secret: &str, expires_in_secs: i64) -> String {
+        use jsonwebtoken::{EncodingKey, Header, encode};
+        let now = chrono::Utc::now().timestamp();
+        let claims = Claims {
+            sub: "tester".to_string(),
+            exp: (now + expires_in_secs) as usize,
+            iat: now as usize,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_rejects_missing_credentials() {
+        let state = auth_test_state(Some(ApiConfig {
+            api_key: Some("secret".to_string()),
+            jwt_secret: None,
+            bind: None,
+            cors_origins: None,
+        }));
+        assert_eq!(
+            auth_request(state, vec![]).await,
+            StatusCode::UNAUTHORIZED,
+            "a configured API must reject unauthenticated requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_rejects_wrong_api_key() {
+        let state = auth_test_state(Some(ApiConfig {
+            api_key: Some("secret".to_string()),
+            jwt_secret: None,
+            bind: None,
+            cors_origins: None,
+        }));
+        assert_eq!(
+            auth_request(state, vec![("X-API-Key", "wrong".to_string())]).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_accepts_correct_api_key() {
+        let state = auth_test_state(Some(ApiConfig {
+            api_key: Some("secret".to_string()),
+            jwt_secret: None,
+            bind: None,
+            cors_origins: None,
+        }));
+        assert_eq!(
+            auth_request(state, vec![("X-API-Key", "secret".to_string())]).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_rejects_bearer_when_only_api_key_configured() {
+        let state = auth_test_state(Some(ApiConfig {
+            api_key: Some("secret".to_string()),
+            jwt_secret: None,
+            bind: None,
+            cors_origins: None,
+        }));
+        assert_eq!(
+            auth_request(
+                state,
+                vec![("Authorization", "Bearer anything".to_string())]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_accepts_valid_jwt_and_rejects_expired() {
+        let state = auth_test_state(Some(ApiConfig {
+            api_key: None,
+            jwt_secret: Some("jwt-secret".to_string()),
+            bind: None,
+            cors_origins: None,
+        }));
+
+        let valid = jwt_for("jwt-secret", 3600);
+        assert_eq!(
+            auth_request(
+                state.clone(),
+                vec![("Authorization", format!("Bearer {valid}"))]
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let expired = jwt_for("jwt-secret", -3600);
+        assert_eq!(
+            auth_request(state, vec![("Authorization", format!("Bearer {expired}"))]).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_auth_allows_when_no_credentials_configured() {
+        // Locks in the intended behaviour of the no-credentials branch. It is
+        // only reachable because start_api_server refuses to bind anything but
+        // loopback in that configuration (see the test below).
+        let state = auth_test_state(None);
+        assert_eq!(auth_request(state, vec![]).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_start_api_server_refuses_public_bind_without_credentials() {
+        let state = auth_test_state(None);
+        let result = start_api_server(IpAddr::from([0, 0, 0, 0]), 0, state).await;
+        let err = result.expect_err("binding 0.0.0.0 without credentials must fail");
+        assert!(
+            err.to_string().contains("non-loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_add_rule_rejects_unknown_strategy() {
+        let (status, _) = invalid_strategy_response("emial");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

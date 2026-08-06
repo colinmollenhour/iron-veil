@@ -256,6 +256,18 @@ impl MySqlCodec {
         }
     }
 
+    /// Client-facing codec already past authentication (used by tests and by
+    /// callers that resume an established session).
+    pub fn new_server_awaiting_command() -> Self {
+        Self {
+            state: MySqlState::Command,
+            capability_flags: 0,
+            is_client_side: false,
+            column_count: 0,
+            pending_large: None,
+        }
+    }
+
     /// Upstream-facing codec resuming after a TLS upgrade: the server
     /// handshake was already consumed, the auth exchange comes next.
     pub fn new_client_awaiting_auth(capability_flags: u32) -> Self {

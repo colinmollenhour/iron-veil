@@ -743,4 +743,83 @@ mod tests {
             "fields-masked counter should be emitted when recording masking stats"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Upstream health threshold state machine. It alone decides whether
+    // /health answers 200 or 503 (and drives every load-balancer and
+    // Kubernetes probe), and had no coverage at all.
+    // ------------------------------------------------------------------
+
+    fn health_state(unhealthy_threshold: u32, healthy_threshold: u32) -> AppState {
+        AppState::new_for_test(
+            AppConfig {
+                health_check: Some(crate::config::HealthCheckConfig {
+                    enabled: true,
+                    interval_secs: 10,
+                    timeout_secs: 5,
+                    unhealthy_threshold,
+                    healthy_threshold,
+                }),
+                ..Default::default()
+            },
+            "proxy.yaml".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_health_starts_unknown_and_flips_only_on_threshold() {
+        let state = health_state(3, 1);
+        assert!(
+            !state.health_status.read().await.healthy,
+            "health must be unknown (not healthy) before the first probe"
+        );
+
+        state.update_health_status(true, Some(1), None).await;
+        assert!(state.health_status.read().await.healthy);
+
+        // Two failures are not enough with unhealthy_threshold: 3
+        state
+            .update_health_status(false, None, Some("boom".into()))
+            .await;
+        assert!(state.health_status.read().await.healthy);
+        state
+            .update_health_status(false, None, Some("boom".into()))
+            .await;
+        assert!(state.health_status.read().await.healthy);
+
+        // The third flips it
+        state
+            .update_health_status(false, None, Some("boom".into()))
+            .await;
+        let status = state.health_status.read().await;
+        assert!(!status.healthy);
+        assert_eq!(status.consecutive_failures, 3);
+        assert_eq!(status.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_health_recovers_after_healthy_threshold_and_resets_counters() {
+        let state = health_state(2, 2);
+
+        state
+            .update_health_status(false, None, Some("down".into()))
+            .await;
+        state
+            .update_health_status(false, None, Some("down".into()))
+            .await;
+        assert!(!state.health_status.read().await.healthy);
+
+        // One success is not enough with healthy_threshold: 2, but it must
+        // reset the failure counter.
+        state.update_health_status(true, Some(2), None).await;
+        {
+            let status = state.health_status.read().await;
+            assert!(!status.healthy);
+            assert_eq!(status.consecutive_failures, 0);
+            assert!(status.last_error.is_none());
+        }
+
+        state.update_health_status(true, Some(2), None).await;
+        assert!(state.health_status.read().await.healthy);
+    }
 }
