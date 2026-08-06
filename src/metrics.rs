@@ -136,6 +136,21 @@ mod tests {
     use super::init_metrics;
 
     #[test]
+    fn test_histograms_export_prometheus_bucket_series() {
+        // Without explicit buckets the exporter emits summaries with no
+        // _bucket series, and every histogram_quantile panel in the shipped
+        // Grafana dashboard renders "No data".
+        let handle = init_metrics();
+        super::record_query_duration("postgres", 0.042);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("ironveil_query_duration_seconds_bucket"),
+            "query duration must export _bucket series, got:\n{rendered}"
+        );
+        assert!(rendered.contains("# TYPE ironveil_query_duration_seconds histogram"));
+    }
+
+    #[test]
     fn test_metrics_init_is_idempotent() {
         let first = init_metrics();
         let second = init_metrics();
