@@ -78,6 +78,25 @@
     ```
     Then open [http://localhost:3000](http://localhost:3000).
 
+Notes:
+
+*   The demo Postgres publishes on `127.0.0.1:5432` only, and its password
+    defaults to `password`. Override it with the `POSTGRES_PASSWORD`
+    environment variable: `POSTGRES_PASSWORD=changeme docker compose up -d`.
+
+### Optional: TLS for the Demo Postgres
+
+TLS on the demo Postgres is opt-in via a compose override. Generate the
+certificates first — `./scripts/generate_certs.sh` creates `./certs/` and also
+sets `certs/server.key` to `999:999` (the postgres container user) so the
+container can read it. If the chown step fails (it may need root), run
+`sudo chown 999:999 certs/server.key` manually.
+
+```bash
+./scripts/generate_certs.sh
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+```
+
 ### Running Locally
 
 ```bash
@@ -418,6 +437,22 @@ Run integration tests in strict mode (fail if required services are not running)
 
 ```bash
 IRONVEIL_REQUIRE_SERVICES=1 cargo test --test integration_test
+```
+
+### End-to-End Test Suite
+
+The full end-to-end suite spins up throwaway database containers, builds the
+proxy, and verifies masking through real `psql`/`mysql` clients (it uses its
+own generated proxy config, not the shipped `proxy.yaml`). It requires
+`docker`, `cargo`, `nc`, `curl`, and `lsof`, plus free ports 5433/3307/6543/3001:
+
+```bash
+# PostgreSQL suite (also run in CI)
+./scripts/test_e2e.sh postgres
+
+# MySQL suite, or both
+./scripts/test_e2e.sh mysql
+./scripts/test_e2e.sh all
 ```
 
 ## Testing OpenTelemetry
