@@ -54,6 +54,11 @@ pub struct HandshakeResponse {
     pub auth_response: Vec<u8>,
     pub database: Option<String>,
     pub auth_plugin_name: Option<String>,
+    /// The packet exactly as the client sent it, including any trailing
+    /// CLIENT_CONNECT_ATTRS block. The proxy does not modify the handshake response, so it is
+    /// forwarded verbatim; re-encoding it from the parsed fields silently dropped connection
+    /// attributes and the server rejected the result with ER_HANDSHAKE_ERROR (1043).
+    pub raw: Bytes,
 }
 
 /// Generic packet for passthrough
@@ -528,6 +533,7 @@ fn parse_handshake_v10(buf: &mut BytesMut) -> Result<HandshakeV10> {
 }
 
 fn parse_handshake_response(buf: &mut BytesMut, _server_caps: u32) -> Result<HandshakeResponse> {
+    let raw = Bytes::copy_from_slice(&buf[..]);
     let capability_flags = buf.get_u32_le();
     let max_packet_size = buf.get_u32_le();
     let character_set = buf.get_u8();
@@ -567,6 +573,7 @@ fn parse_handshake_response(buf: &mut BytesMut, _server_caps: u32) -> Result<Han
         auth_response,
         database,
         auth_plugin_name,
+        raw,
     })
 }
 
@@ -751,6 +758,16 @@ fn encode_handshake_v10(h: &HandshakeV10, dst: &mut BytesMut) {
 }
 
 fn encode_handshake_response(r: &HandshakeResponse, dst: &mut BytesMut) {
+    // Forward the client's packet byte-for-byte. Rebuilding it from parsed fields loses the
+    // CLIENT_CONNECT_ATTRS block (and mis-handles CLIENT_CONNECT_WITH_DB, which this parser
+    // infers from "are there bytes left" rather than from the capability bit), which the
+    // server rejects with ER_HANDSHAKE_ERROR.
+    if !r.raw.is_empty() {
+        write_packet_header(dst, r.raw.len(), 1);
+        dst.put_slice(&r.raw);
+        return;
+    }
+
     let mut payload = BytesMut::new();
     payload.put_u32_le(r.capability_flags);
     payload.put_u32_le(r.max_packet_size);
