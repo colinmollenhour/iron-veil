@@ -1179,9 +1179,16 @@ where
     let handshake = match upstream_framed.next().await {
         Some(Ok(MySqlMessage::Handshake(h))) => {
             info!(server_version = %h.server_version, "Received MySQL handshake from upstream");
-            // Forward the handshake to the client
+            // Advertise to the client only what this proxy can actually serve. Forwarding
+            // the upstream's CLIENT_SSL makes any TLS-preferring client (mysql 8.x and
+            // MySQL 8.4 defaults) attempt a TLS upgrade the proxy cannot answer; forwarding
+            // CLIENT_COMPRESS would produce a compressed stream the codec cannot frame.
+            // In both cases the masking layer would be bypassed or the connection dropped.
+            let mut client_handshake = h.clone();
+            client_handshake.capability_flags &=
+                !(crate::protocol::mysql::CLIENT_SSL | crate::protocol::mysql::CLIENT_COMPRESS);
             client_framed
-                .send(MySqlMessage::Handshake(h.clone()))
+                .send(MySqlMessage::Handshake(client_handshake))
                 .await?;
             h
         }

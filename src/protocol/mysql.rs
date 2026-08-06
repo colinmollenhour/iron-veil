@@ -123,6 +123,8 @@ pub struct EofPacket {
 }
 
 // Capability flags
+pub const CLIENT_SSL: u32 = 1 << 11;
+pub const CLIENT_COMPRESS: u32 = 1 << 5;
 pub const CLIENT_PROTOCOL_41: u32 = 1 << 9;
 pub const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 pub const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
@@ -381,7 +383,16 @@ impl Encoder<MySqlMessage> for MySqlCodec {
 
     fn encode(&mut self, item: MySqlMessage, dst: &mut BytesMut) -> Result<()> {
         match item {
-            MySqlMessage::Handshake(h) => encode_handshake_v10(&h, dst),
+            MySqlMessage::Handshake(h) => {
+                encode_handshake_v10(&h, dst);
+                // The client-facing codec never decodes a handshake — the proxy forwards the
+                // upstream one — so its decoder state must be advanced here. Without this the
+                // client's handshake response is decoded in WaitingHandshake state, comes back
+                // as Generic, and the connection is aborted.
+                if !self.is_client_side && matches!(self.state, MySqlState::WaitingHandshake) {
+                    self.state = MySqlState::WaitingHandshakeResponse;
+                }
+            }
             MySqlMessage::HandshakeResponse(r) => encode_handshake_response(&r, dst),
             MySqlMessage::Generic(g) => encode_generic(&g, dst),
             MySqlMessage::Query(q) => encode_query(&q, dst),
