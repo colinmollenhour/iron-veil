@@ -8,7 +8,7 @@
 //! - Upstream pool usage and wait time
 
 use metrics::{counter, gauge, histogram};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::sync::OnceLock;
 
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -18,7 +18,21 @@ static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 pub fn init_metrics() -> PrometheusHandle {
     METRICS_HANDLE
         .get_or_init(|| {
+            // Without explicit buckets, metrics-exporter-prometheus exports
+            // every histogram! as a summary with no _bucket series, and the
+            // shipped Grafana histogram_quantile panels render "No data".
             PrometheusBuilder::new()
+                .set_buckets(&[
+                    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+                ])
+                .expect("bucket list is a non-empty constant")
+                .set_buckets_for_metric(
+                    Matcher::Full("ironveil_upstream_health_check_latency_ms".to_string()),
+                    &[
+                        1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0,
+                    ],
+                )
+                .expect("bucket list is a non-empty constant")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder")
         })
@@ -56,6 +70,12 @@ pub fn record_fields_masked(count: u64) {
 /// Record masking error
 pub fn record_masking_error() {
     counter!("ironveil_masking_errors_total").increment(1);
+}
+
+/// Record a rejected binary-protocol (prepared statement) command.
+/// The MySQL binary protocol is unsupported: rows would bypass masking.
+pub fn record_binary_protocol_rejected() {
+    counter!("ironveil_binary_protocol_rejected_total").increment(1);
 }
 
 /// Record upstream health check

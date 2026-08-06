@@ -238,6 +238,41 @@ impl Drop for UpstreamSlotLease {
     }
 }
 
+/// Replace SQL string-literal contents with '?' before logging: query text in
+/// INSERT/WHERE clauses routinely carries the exact PII this proxy exists to
+/// suppress, and the log ring is re-served by GET /logs.
+fn redact_sql_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            out.push_str("'?'");
+            let mut escaped = false;
+            while let Some(n) = chars.next() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match n {
+                    '\\' => escaped = true,
+                    '\'' => {
+                        // '' is an escaped quote inside the literal
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn resolve_timeout_limits(
     limits: Option<&crate::config::LimitsConfig>,
 ) -> (Duration, Duration, Duration) {
@@ -983,7 +1018,7 @@ where
                                     timestamp: Utc::now(),
                                     connection_id,
                                     event_type: "Query".to_string(),
-                                    content: query_str.clone(),
+                                    content: redact_sql_literals(&query_str),
                                     details: None,
                                 }).await;
 
@@ -995,6 +1030,10 @@ where
                                     .to_uppercase();
                                 state.record_query(&query_type).await;
 
+                                // Drop any stale index->strategy map from a previous
+                                // statement before its result set arrives.
+                                interceptor.reset_columns();
+
                                 upstream_framed.send(msg).await?;
                             }
                             PgMessage::Parse(ref p) => {
@@ -1005,7 +1044,7 @@ where
                                     timestamp: Utc::now(),
                                     connection_id,
                                     event_type: "Parse".to_string(),
-                                    content: query_str.clone(),
+                                    content: redact_sql_literals(&query_str),
                                     details: None,
                                 }).await;
 
@@ -1016,6 +1055,8 @@ where
                                     .unwrap_or("OTHER")
                                     .to_uppercase();
                                 state.record_query(&query_type).await;
+
+                                interceptor.reset_columns();
 
                                 upstream_framed.send(msg).await?;
                             }
@@ -1259,28 +1300,59 @@ where
             msg = client_framed.next() => {
                 match msg {
                     Some(Ok(msg)) => {
-                        if let MySqlMessage::Query(q) = &msg {
-                            let query_str = String::from_utf8_lossy(&q.query).to_string();
-                            let id = format!("{:x}", rand::random::<u128>());
-                            state.add_log(LogEntry {
-                                id,
-                                timestamp: Utc::now(),
-                                connection_id,
-                                event_type: "MySqlQuery".to_string(),
-                                content: query_str.clone(),
-                                details: None,
-                            }).await;
+                        match &msg {
+                            MySqlMessage::Query(q) => {
+                                let query_str = String::from_utf8_lossy(&q.query).to_string();
+                                let id = format!("{:x}", rand::random::<u128>());
+                                state.add_log(LogEntry {
+                                    id,
+                                    timestamp: Utc::now(),
+                                    connection_id,
+                                    event_type: "MySqlQuery".to_string(),
+                                    content: redact_sql_literals(&query_str),
+                                    details: None,
+                                }).await;
 
-                            // Record query type stats
-                            let query_type = query_str
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("OTHER")
-                                .to_uppercase();
-                            state.record_query(&query_type).await;
+                                // Record query type stats
+                                let query_type = query_str
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or("OTHER")
+                                    .to_uppercase();
+                                state.record_query(&query_type).await;
 
-                            // Reset interceptor for new result set
-                            interceptor.reset_columns();
+                                // Reset interceptor and response codec for the
+                                // new result set — a desynced response stream
+                                // must not survive past the next command.
+                                interceptor.reset_columns();
+                                upstream_framed.codec_mut().set_command_state();
+                            }
+                            MySqlMessage::Generic(g) => {
+                                // COM_STMT_PREPARE / COM_STMT_EXECUTE / COM_STMT_FETCH: the
+                                // binary protocol is unsupported — its result rows would
+                                // bypass masking entirely. Reject visibly with ER_UNSUPPORTED_PS
+                                // (most connectors fall back to client-side statements) instead
+                                // of forwarding a stream the codec would misparse.
+                                if let Some(cmd @ (0x16 | 0x17 | 0x1c)) = g.payload.first() {
+                                    tracing::warn!(
+                                        command = format!("0x{cmd:02x}"),
+                                        "rejecting MySQL binary-protocol command; \
+                                         iron-veil masks the text protocol only"
+                                    );
+                                    metrics::record_binary_protocol_rejected();
+                                    let err = crate::protocol::mysql::ErrPacket::proxy_error(
+                                        1,
+                                        1295, // ER_UNSUPPORTED_PS
+                                        b"HY000",
+                                        "iron-veil: server-side prepared statements (binary \
+                                         protocol) are not supported; use the text protocol",
+                                    );
+                                    client_framed.send(MySqlMessage::Err(err)).await?;
+                                    continue;
+                                }
+                                upstream_framed.codec_mut().set_command_state();
+                            }
+                            _ => {}
                         }
                         upstream_framed.send(msg).await?;
                     }

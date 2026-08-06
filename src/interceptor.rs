@@ -751,6 +751,7 @@ mod tests {
             column_type: 253,
             flags: 0,
             decimals: 0,
+            raw: bytes::Bytes::new(),
         }
     }
 
