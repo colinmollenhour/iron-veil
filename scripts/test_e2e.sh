@@ -190,6 +190,32 @@ assert_api_response() {
     return 0
 }
 
+# Is something accepting TCP connections on host:port?
+#
+# Uses bash's built-in /dev/tcp redirection rather than nc/socat/lsof: those
+# are three different tools with three different flag dialects across
+# platforms, and a missing one used to read as "port is free" (which is how
+# the port-conflict preflight silently passed). The subshell closes the
+# descriptor on exit, and every call site targets localhost, so a refused
+# connection returns immediately rather than waiting on a connect timeout.
+tcp_port_open() {
+    local host=$1 port=$2
+    (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null
+}
+
+# bash can be built with --disable-net-redirections, in which case /dev/tcp is
+# a nonexistent path rather than a socket. Detect that once, up front, instead
+# of having every probe quietly report "nothing is listening".
+require_tcp_probe() {
+    local err
+    err=$( (exec 3<>/dev/tcp/127.0.0.1/1) 2>&1 || true )
+    if [[ "$err" == *"No such file"* ]]; then
+        echo -e "${RED}This bash was built without /dev/tcp support, which this suite uses for port probes.${NC}" >&2
+        echo "  Run the suite with a bash that has network redirections enabled." >&2
+        exit 1
+    fi
+}
+
 # Wait for a service to be ready
 wait_for_port() {
     local port=$1
@@ -197,7 +223,7 @@ wait_for_port() {
     local max_attempts=30
     local attempt=0
 
-    while ! nc -z localhost "$port" 2>/dev/null; do
+    while ! tcp_port_open localhost "$port"; do
         attempt=$((attempt + 1))
         if [ "$attempt" -ge "$max_attempts" ]; then
             log_error "Timeout waiting for $name on port $port"
@@ -320,9 +346,10 @@ check_ports() {
     fi
 
     for port in "${ports[@]}"; do
-        if lsof -i ":$port" > /dev/null 2>&1; then
-            log_error "Port $port is in use"
-            echo "  Run: docker compose down && lsof -ti :$port | xargs kill -9"
+        if tcp_port_open 127.0.0.1 "$port"; then
+            log_error "Port $port is already accepting connections"
+            echo "  A previous run may still be up. Try: docker compose down"
+            echo "  To find the listener: ss -ltnp 'sport = :$port'  (or: lsof -ti :$port)"
             exit 1
         fi
     done
@@ -882,7 +909,11 @@ main() {
     echo -e "  Protocol: ${BOLD}$TEST_PROTOCOL${NC}"
     echo -e "  Time: $(date)"
 
-    require_tools docker cargo nc curl lsof mktemp sed grep
+    # Port probing is done with bash's own /dev/tcp, so nc/socat/lsof are not
+    # required. curl carries the management-API assertions; the psql and mysql
+    # clients run inside the test containers rather than on the host.
+    require_tools docker cargo curl mktemp sed grep
+    require_tcp_probe
     detect_docker_host_addr
     write_e2e_config
     check_ports

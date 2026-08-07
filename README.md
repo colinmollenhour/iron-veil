@@ -560,8 +560,10 @@ IRONVEIL_REQUIRE_SERVICES=1 cargo test --test integration_test
 
 The full end-to-end suite spins up throwaway database containers, builds the
 proxy, and verifies masking through real `psql`/`mysql` clients (it uses its
-own generated proxy config, not the shipped `proxy.yaml`). It requires
-`docker`, `cargo`, `nc`, `curl`, and `lsof`, plus free ports 5433/3307/6543/3001:
+own generated proxy config, not the shipped `proxy.yaml`). It requires only
+`docker`, `cargo` and `curl`, plus free ports 5433/3307/6543/3001 — port
+probing uses bash's built-in `/dev/tcp`, and the `psql`/`mysql` clients run
+inside the test containers rather than on the host:
 
 ```bash
 # PostgreSQL suite (also run in CI)
