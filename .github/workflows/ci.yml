@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -51,9 +52,20 @@ jobs:
       - name: Wait for proxy API readiness
         run: |
           for i in {1..60}; do
-            if curl -fsS http://127.0.0.1:3001/health | jq -e '.upstream.healthy == true' > /dev/null 2>&1; then
-              echo "Proxy API is ready and upstream is healthy"
+            # Prefer host-published port; fall back to in-container curl so a
+            # loopback-only API bind still unblocks diagnostics.
+            if curl -fsS http://127.0.0.1:3001/health 2>/dev/null \
+                | jq -e '.upstream.healthy == true' > /dev/null 2>&1; then
+              echo "Proxy API is ready and upstream is healthy (host :3001)"
               exit 0
+            fi
+            if docker compose exec -T proxy curl -fsS http://127.0.0.1:3001/health 2>/dev/null \
+                | jq -e '.upstream.healthy == true' > /dev/null 2>&1; then
+              echo "Proxy API is healthy inside the container, but host :3001 is not reachable."
+              echo "Published management API must bind 0.0.0.0 (see proxy.compose.yaml)."
+              docker compose ps
+              docker compose logs --no-color --tail=50 proxy || true
+              exit 1
             fi
             echo "Waiting for proxy API / healthy upstream... ($i/60)"
             sleep 2

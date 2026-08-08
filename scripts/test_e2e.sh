@@ -27,9 +27,13 @@ GRACEFUL_API_PORT=3099
 PROXY_PID=""
 TEST_PROTOCOL="${1:-postgres}"  # Default to postgres, can pass 'mysql' or 'all'
 
-# Container images (postgres tag kept in sync with docker-compose.yml)
+# Container images (postgres tag kept in sync with docker-compose.yml).
+# Pin MySQL to 8.0: 8.4 defaults to caching_sha2_password, which needs either
+# TLS or an RSA public-key exchange the cleartext proxy path does not yet
+# handle cleanly (auth packets get misread as column definitions). 8.0 still
+# supports mysql_native_password for non-TLS e2e.
 POSTGRES_IMAGE="postgres:17"
-MYSQL_IMAGE="mysql:8"
+MYSQL_IMAGE="mysql:8.0"
 
 # Counters
 TESTS_PASSED=0
@@ -140,11 +144,19 @@ run_query_mysql() {
     local sql="$1"
     QUERY_OK=false
     QUERY_OUTPUT=""
+    # Keep mysql's "Using a password on the command line" warning off stdout so
+    # assert_masked's row count is not inflated by the CLI noise (2>&1 used to
+    # make the warning look like a second result row).
+    local err
+    err=$(mktemp -t ironveil-mysql-err.XXXXXX)
     if QUERY_OUTPUT=$(docker run --rm "$MYSQL_IMAGE" \
         mysql -h "$DOCKER_HOST_ADDR" -P "$PROXY_PORT" -uroot -ppassword testdb \
-        --skip-column-names -e "$sql" 2>&1); then
+        --skip-column-names -e "$sql" 2>"$err"); then
         QUERY_OK=true
+    else
+        QUERY_OUTPUT=$(cat "$err")
     fi
+    rm -f "$err"
 }
 
 # Positive-then-negative masking assertion:
@@ -494,11 +506,14 @@ setup_mysql() {
     log_section "Starting MySQL container..."
 
     docker rm -f mysql-test 2>/dev/null || true
+    # mysql_native_password keeps cleartext e2e auth working through the proxy
+    # without TLS (see MYSQL_IMAGE comment above).
     docker run --name mysql-test \
         -e MYSQL_ROOT_PASSWORD=password \
         -e MYSQL_DATABASE=testdb \
         -p "$MYSQL_PORT:3306" \
-        -d "$MYSQL_IMAGE" > /dev/null
+        -d "$MYSQL_IMAGE" \
+        --default-authentication-plugin=mysql_native_password > /dev/null
 
     log_info "Waiting for MySQL to initialize (this takes ~30s)..."
     sleep 30

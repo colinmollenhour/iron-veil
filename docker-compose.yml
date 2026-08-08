@@ -12,8 +12,24 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - ./proxy.yaml:/usr/local/bin/proxy.yaml
-    command: ["./iron-veil", "--upstream-host", "postgres", "--upstream-port", "5432", "--config", "proxy.yaml", "--api-port", "3001"]
+      # Compose-specific config binds the API on 0.0.0.0 with a demo key so
+      # published port 3001 is reachable from the host (CI health gate + cargo
+      # integration tests). Local binary runs still use proxy.yaml (loopback).
+      - ./proxy.compose.yaml:/usr/local/bin/proxy.yaml:ro
+    command:
+      [
+        "./iron-veil",
+        "--upstream-host",
+        "postgres",
+        "--upstream-port",
+        "5432",
+        "--config",
+        "proxy.yaml",
+        "--api-port",
+        "3001",
+        "--api-bind",
+        "0.0.0.0",
+      ]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3001/health"]
       interval: 10s

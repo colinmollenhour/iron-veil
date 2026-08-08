@@ -112,9 +112,25 @@ async fn is_proxy_running() -> bool {
     is_port_open(PROXY_PORT).await
 }
 
-/// Helper to check if API is running
+/// Helper to check if the management API is actually answering HTTP.
+///
+/// TCP connect alone is not enough: Docker may publish port 3001 while the
+/// process only listens on loopback *inside* the container, so the host sees
+/// an accepted-then-reset connection. Probe `/health` instead.
 async fn is_api_running() -> bool {
-    is_port_open(API_PORT).await
+    let client = reqwest::Client::new();
+    match client
+        .get(format!("http://{}:{}/health", PROXY_HOST, API_PORT))
+        .timeout(CONNECTION_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            status == 200 || status == 503
+        }
+        Err(_) => false,
+    }
 }
 
 async fn is_port_open(port: u16) -> bool {
@@ -164,17 +180,25 @@ async fn assert_protected_json_response(
         );
     } else if status == 401 {
         let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON body");
-        assert_eq!(
-            body.get("error").and_then(|v| v.as_str()),
-            Some("Authentication required"),
-            "{} unauthorized response should include auth error",
-            endpoint_name
-        );
+        let error = body.get("error").and_then(|v| v.as_str());
+        // Unauthenticated request → "Authentication required" (+ methods).
+        // Wrong key → "Invalid API key". Both are valid protected-endpoint 401s.
         assert!(
-            body.get("methods").is_some(),
-            "{} unauthorized response should include auth methods",
-            endpoint_name
+            matches!(
+                error,
+                Some("Authentication required") | Some("Invalid API key")
+            ),
+            "{} unauthorized response should include auth error, got {:?}",
+            endpoint_name,
+            error
         );
+        if error == Some("Authentication required") {
+            assert!(
+                body.get("methods").is_some(),
+                "{} unauthorized response should include auth methods",
+                endpoint_name
+            );
+        }
     } else {
         panic!("{} should return 200 or 401, got {}", endpoint_name, status);
     }
