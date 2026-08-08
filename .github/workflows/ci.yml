@@ -75,9 +75,13 @@ jobs:
         run: docker compose down -v --remove-orphans
 
   e2e:
-    name: E2E (PostgreSQL)
+    name: E2E (${{ matrix.protocol }})
     runs-on: ubuntu-latest
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: [postgres, mysql]
     steps:
       - uses: actions/checkout@v4
 
@@ -93,8 +97,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run E2E suite
-        continue-on-error: false
-        run: ./scripts/test_e2e.sh postgres
+        run: ./scripts/test_e2e.sh ${{ matrix.protocol }}
 
   lint:
     name: Static Analysis
