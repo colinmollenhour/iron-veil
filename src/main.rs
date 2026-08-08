@@ -1627,16 +1627,30 @@ async fn handle_mysql_protocol(
                 return Ok(());
             }
             Some(Ok(other)) => {
-                // Auth switch request / auth more data: forward and relay the
-                // client's reply back upstream.
+                // Intermediate auth packet (AuthMoreData / AuthSwitchRequest).
+                // Forward to the client, but only wait for a client reply when
+                // the protocol actually requires one. caching_sha2_password
+                // fast-auth success (0x01 0x03) is followed immediately by OK
+                // with no client bytes — waiting hangs every successful MySQL 8
+                // login through the proxy.
+                let expects_reply = match &other {
+                    MySqlMessage::Generic(g) => {
+                        crate::protocol::mysql::auth_packet_expects_client_reply(&g.payload)
+                    }
+                    // Parsed OK/ERR are handled above; anything else during auth
+                    // is treated as needing a client reply.
+                    _ => true,
+                };
                 client_framed.send(other).await?;
-                match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("client auth response timed out"))?
-                {
-                    Some(Ok(reply)) => upstream_framed.send(reply).await?,
-                    Some(Err(e)) => return Err(e),
-                    None => return Ok(()),
+                if expects_reply {
+                    match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("client auth response timed out"))?
+                    {
+                        Some(Ok(reply)) => upstream_framed.send(reply).await?,
+                        Some(Err(e)) => return Err(e),
+                        None => return Ok(()),
+                    }
                 }
             }
             Some(Err(e)) => return Err(e),
