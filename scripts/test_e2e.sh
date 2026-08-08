@@ -424,9 +424,11 @@ CREATE TABLE customers (
     credit_card TEXT,
     notes TEXT
 );
+-- Credit-card fixtures must be Luhn-valid: the scanner rejects arbitrary
+-- 16-digit strings so heuristics do not rewrite order numbers.
 INSERT INTO customers (customer_email, credit_card, notes) VALUES
-    ('secret@hidden.org', '4532-1234-5678-9012', 'Regular customer'),
-    ('private@email.net', '5425-9876-5432-1098', 'VIP member');
+    ('secret@hidden.org', '4111-1111-1111-1111', 'Regular customer'),
+    ('private@email.net', '4532-0151-1283-0366', 'VIP member');
 
 -- JSON data table
 DROP TABLE IF EXISTS profiles;
@@ -444,7 +446,7 @@ CREATE TABLE tags (
     values TEXT[]
 );
 INSERT INTO tags (values) VALUES
-    (ARRAY['normal_tag', 'array@email.com', '9999-8888-7777-6666']);
+    (ARRAY['normal_tag', 'array@email.com', '4111-1111-1111-1111']);
 EOF
 
     log_success "PostgreSQL seeded with test data"
@@ -476,7 +478,7 @@ run_postgres_tests() {
     run_query_pg "SELECT customer_email, credit_card, notes FROM customers;"
     echo "$QUERY_OUTPUT"
     assert_masked 2 "secret@hidden.org" "Heuristic: Email detected and masked"
-    assert_masked 2 "4532-1234-5678-9012" "Heuristic: Credit card detected and masked"
+    assert_masked 2 "4111-1111-1111-1111" "Heuristic: Credit card detected and masked"
 
     # Test 3: JSON masking
     log_section "Test: JSON Recursive Masking"
@@ -490,7 +492,7 @@ run_postgres_tests() {
     run_query_pg "SELECT values FROM tags;"
     echo "$QUERY_OUTPUT"
     assert_masked 1 "array@email.com" "Array: Email element was masked"
-    assert_masked 1 "9999-8888-7777-6666" "Array: Credit card element was masked"
+    assert_masked 1 "4111-1111-1111-1111" "Array: Credit card element was masked"
 
     # Stop proxy for next test suite
     kill "$PROXY_PID" 2>/dev/null || true

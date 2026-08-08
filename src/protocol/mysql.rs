@@ -186,9 +186,37 @@ pub fn build_ssl_request(
 pub const CLIENT_SSL: u32 = 1 << 11;
 pub const CLIENT_COMPRESS: u32 = 1 << 5;
 pub const CLIENT_PROTOCOL_41: u32 = 1 << 9;
+pub const CLIENT_CONNECT_WITH_DB: u32 = 1 << 3;
 pub const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 pub const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
+pub const CLIENT_CONNECT_ATTRS: u32 = 1 << 20;
 pub const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
+
+/// caching_sha2_password AuthMoreData status: fast path succeeded; server will
+/// send OK next without a client reply.
+pub const AUTH_MORE_DATA_FAST_AUTH_SUCCESS: u8 = 0x03;
+/// caching_sha2_password AuthMoreData status: full authentication required;
+/// client must send the password (or request the server public key).
+pub const AUTH_MORE_DATA_FULL_AUTH_REQUIRED: u8 = 0x04;
+
+/// Whether an intermediate auth-phase packet from the server expects a client
+/// reply before the next server packet.
+///
+/// `caching_sha2_password` fast auth success is a single-byte AuthMoreData
+/// (`0x01 0x03`) followed immediately by OK — the client does **not** reply.
+/// Waiting for a client packet in that case hangs every successful MySQL 8
+/// connection through the proxy once the server has the password cached.
+pub fn auth_packet_expects_client_reply(payload: &[u8]) -> bool {
+    match payload.first().copied() {
+        // AuthMoreData (0x01). Only the fast-auth-success status skips a reply.
+        Some(0x01) => payload.get(1).copied() != Some(AUTH_MORE_DATA_FAST_AUTH_SUCCESS),
+        // AuthSwitchRequest (0xfe during auth) — client must choose plugin / send data.
+        Some(0xfe) => true,
+        // Unknown intermediate packet: wait for a client reply (fail closed on hang
+        // risk rather than dropping a required password exchange).
+        _ => true,
+    }
+}
 
 /// State machine for MySQL codec
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -780,7 +808,10 @@ fn parse_handshake_response(buf: &mut BytesMut, _server_caps: u32) -> Result<Han
         data
     };
 
-    let database = if buf.has_remaining() {
+    // Only present when CLIENT_CONNECT_WITH_DB is set. Without this check a
+    // client that omits a default schema but sets CLIENT_PLUGIN_AUTH has its
+    // plugin name misread as the database (harmless for raw forward, wrong for logs).
+    let database = if capability_flags & CLIENT_CONNECT_WITH_DB != 0 && buf.has_remaining() {
         Some(read_null_terminated_string(buf).ok().unwrap_or_default())
     } else {
         None
@@ -791,6 +822,9 @@ fn parse_handshake_response(buf: &mut BytesMut, _server_caps: u32) -> Result<Han
     } else {
         None
     };
+
+    // CLIENT_CONNECT_ATTRS trailing block is intentionally ignored here — the
+    // raw packet is forwarded verbatim by the encoder.
 
     Ok(HandshakeResponse {
         capability_flags,
@@ -1568,6 +1602,81 @@ mod tests {
         codec.set_state_for_test(MySqlState::WaitingHandshakeResponse);
         let mut src = BytesMut::from(&bytes[..]);
         assert!(codec.decode(&mut src).is_err());
+    }
+
+    #[test]
+    fn test_auth_packet_expects_client_reply_for_caching_sha2() {
+        // Fast auth success: server continues with OK; client must not be waited on.
+        assert!(!auth_packet_expects_client_reply(&[
+            0x01,
+            AUTH_MORE_DATA_FAST_AUTH_SUCCESS
+        ]));
+        // Full auth required: client sends password / pubkey request.
+        assert!(auth_packet_expects_client_reply(&[
+            0x01,
+            AUTH_MORE_DATA_FULL_AUTH_REQUIRED
+        ]));
+        // Auth switch request.
+        assert!(auth_packet_expects_client_reply(
+            b"\xfemysql_native_password\0"
+        ));
+        // RSA public key payload (AuthMoreData with PEM) needs a client reply next
+        // only after full-auth was requested earlier; the packet itself is 0x01+data
+        // without the 0x03 status — treat as expecting reply (conservative).
+        assert!(auth_packet_expects_client_reply(
+            b"\x01-----BEGIN PUBLIC KEY-----"
+        ));
+    }
+
+    #[test]
+    fn test_handshake_response_plugin_auth_without_database() {
+        // CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
+        // without CLIENT_CONNECT_WITH_DB: trailing string is the plugin, not the DB.
+        let caps: u32 = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+        let mut payload = BytesMut::new();
+        payload.put_u32_le(caps);
+        payload.put_u32_le(16_777_216);
+        payload.put_u8(45);
+        payload.put_slice(&[0u8; 23]);
+        payload.put_slice(b"shipstream\0");
+        payload.put_u8(1); // auth response length
+        payload.put_u8(0x00);
+        payload.put_slice(b"caching_sha2_password\0");
+
+        let mut buf = payload.clone();
+        let resp = parse_handshake_response(&mut buf, caps).expect("parse");
+        assert_eq!(resp.username, "shipstream");
+        assert_eq!(resp.database, None);
+        assert_eq!(
+            resp.auth_plugin_name.as_deref(),
+            Some("caching_sha2_password")
+        );
+    }
+
+    #[test]
+    fn test_handshake_response_with_database_and_plugin() {
+        let caps: u32 = CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_CONNECT_WITH_DB;
+        let mut payload = BytesMut::new();
+        payload.put_u32_le(caps);
+        payload.put_u32_le(16_777_216);
+        payload.put_u8(45);
+        payload.put_slice(&[0u8; 23]);
+        payload.put_slice(b"shipstream\0");
+        payload.put_u8(1);
+        payload.put_u8(0x00);
+        payload.put_slice(b"shipstream_sample\0");
+        payload.put_slice(b"caching_sha2_password\0");
+
+        let mut buf = payload.clone();
+        let resp = parse_handshake_response(&mut buf, caps).expect("parse");
+        assert_eq!(resp.database.as_deref(), Some("shipstream_sample"));
+        assert_eq!(
+            resp.auth_plugin_name.as_deref(),
+            Some("caching_sha2_password")
+        );
     }
 
     #[test]

@@ -152,10 +152,9 @@ fn pg_conn_str(port: u16) -> String {
 }
 
 /// Connect with tokio-postgres and spawn the connection driver.
-async fn connect_postgres(
-    port: u16,
-) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::connect(&pg_conn_str(port), tokio_postgres::NoTls).await?;
+async fn connect_postgres(port: u16) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+    let (client, connection) =
+        tokio_postgres::connect(&pg_conn_str(port), tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("postgres connection closed: {e}");
