@@ -132,7 +132,8 @@ impl PiiScanner {
 
     /// Scan for any known PII type (used by the offline /scan reporting path).
     pub fn scan(&self, text: &str) -> Option<PiiType> {
-        self.scan_allowed(text, &PiiType::all())
+        static ALL_PII_TYPES: LazyLock<HashSet<PiiType>> = LazyLock::new(PiiType::all);
+        self.scan_allowed(text, &ALL_PII_TYPES)
     }
 
     /// Scan for the subset of PII types enabled for runtime heuristics.
