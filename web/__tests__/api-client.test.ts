@@ -130,7 +130,7 @@ describe("api client", () => {
   it("returns the degraded /health body instead of throwing on 503", async () => {
     const degradedBody = {
       status: "degraded",
-      version: "0.1.1",
+      version: "0.2.0",
       upstream: { healthy: false, host: "db.internal" },
     }
     const fetchMock = jest.fn().mockResolvedValue({
