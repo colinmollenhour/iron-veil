@@ -4,7 +4,63 @@ All notable changes to IronVeil are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows semantic versioning.
 
-## [Unreleased]
+## [0.3.0]
+
+Hardening for the sidecar deployment shape: a credential boundary, a
+lockable listen surface, and an audit path that keeps nothing it shouldn't.
+
+### Added
+
+- **`auth.mode: terminate`** — iron-veil holds the upstream MySQL credential
+  and authenticates its clients against a separately-configured local one, so
+  the process exposed to clients never handles the database password.
+  `passthrough` (the previous, credential-transparent behaviour) stays the
+  default. Supports `caching_sha2_password` and `mysql_native_password` on
+  both legs; secrets can come from the config, a file (secret mounts) or the
+  environment. The client leg never needs full authentication — iron-veil
+  holds the cleartext password, so it satisfies fast auth on the first
+  connection. See "Authentication Modes" in the README.
+- **Optional mTLS**: `tls.client_ca_path` verifies client certificates against
+  a CA bundle, and `tls.require_client_cert` makes one mandatory. Off by
+  default.
+- **`listen.bind` / `listen.port`**, `api.port`, and `api.enabled: false`
+  (`--no-api`) to drop the management API entirely rather than binding it to
+  loopback and hoping.
+- Environment overrides for every listen setting: `IRONVEIL_BIND`,
+  `IRONVEIL_PORT`, `IRONVEIL_API_BIND`, `IRONVEIL_API_PORT`,
+  `IRONVEIL_API_ENABLED`. Precedence is CLI > environment > config > default.
+- `first_name`, `last_name` and `company` masking strategies. `name` put a
+  full name in every column it touched, which on a schema that splits a person
+  across `firstname`/`lastname` reads as corrupt data rather than a pseudonym.
+- `ironveil_client_auth_total` metric (labelled by outcome) for the
+  terminating-auth path.
+
+### Changed
+
+- `--shutdown-timeout` defaults to 10s, down from 30s. 30s exceeded the
+  `docker stop` default, so a stuck connection guaranteed a SIGKILL.
+
+### Fixed
+
+- **SIGTERM could be lost.** The accept loop built a fresh signal future on
+  every iteration, so each accepted connection dropped and re-registered the
+  handlers; a signal delivered in that window went nowhere. Handlers are now
+  installed once, before the first accept. Connections still negotiating MySQL
+  auth also ignored cancellation for up to 15s — longer than the shutdown
+  timeout — so a rollout that caught a connecting client always ended in a
+  forced abort.
+- **Pre-masking fragments in the audit path.** MySQL double-quoted string
+  literals were logged in cleartext (`"..."` is a string literal in MySQL, and
+  only single quotes were redacted); partial rewrites echoed the untouched
+  remainder of the value, which is original result data; and scan-report
+  samples kept the first and last three characters of the sampled value
+  (`alice@example.com` → `ali***com`). None of these reach the log ring or
+  `GET /logs` now.
+- With `upstream_tls`, the forwarded MySQL handshake response was sent with
+  sequence id 1, but the SSLRequest had already consumed it — MySQL answers
+  `ER_NET_PACKETS_OUT_OF_ORDER`.
+
+## [0.2.0]
 
 A production-readiness pass over the whole repository, driven by a
 multi-model audit and a black-box vetting run against MySQL 8.4.
