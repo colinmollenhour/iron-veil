@@ -564,10 +564,8 @@ async fn main() -> Result<()> {
             info!("TLS enabled. Loading certs from {}", tls_config.cert_path);
             let certs = load_certs(&tls_config.cert_path)?;
             let key = load_keys(&tls_config.key_path)?;
-            let config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(certs, key)?;
-            Some(TlsAcceptor::from(Arc::new(config)))
+            let server_config = build_client_tls_config(tls_config, certs, key)?;
+            Some(TlsAcceptor::from(Arc::new(server_config)))
         } else {
             info!("TLS disabled in config.");
             None
@@ -1102,6 +1100,57 @@ async fn process_postgres_connection(
         cancel,
     )
     .await
+}
+
+/// Build the client-facing rustls ServerConfig, wiring up mTLS when configured.
+///
+/// Without `client_ca_path` this is the historical behaviour: TLS with no
+/// client authentication. With it, client certificates are verified against the
+/// configured CA bundle — required when `require_client_cert` is set, optional
+/// otherwise, which is the shape needed to roll mTLS out to existing clients
+/// without a flag day.
+fn build_client_tls_config(
+    tls_config: &crate::config::TlsConfig,
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig> {
+    let Some(ca_path) = tls_config.client_ca_path.as_deref() else {
+        return Ok(ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?);
+    };
+
+    let ca_certs = load_certs(ca_path)
+        .map_err(|e| anyhow::anyhow!("failed to read tls.client_ca_path '{ca_path}': {e}"))?;
+    if ca_certs.is_empty() {
+        anyhow::bail!("tls.client_ca_path '{ca_path}' contains no certificates");
+    }
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        roots
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("invalid CA certificate in '{ca_path}': {e}"))?;
+    }
+
+    // Build against an explicit provider rather than the process default: the
+    // default is only installed if something else installed it first, and a
+    // missing one surfaces as a panic at connection time rather than at boot.
+    let builder = tokio_rustls::rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(default_provider()),
+    );
+    let verifier = if tls_config.require_client_cert {
+        info!("mTLS: client certificates are required, verified against {ca_path}");
+        builder.build()
+    } else {
+        info!("mTLS: client certificates are optional, verified against {ca_path} when presented");
+        builder.allow_unauthenticated().build()
+    }
+    .map_err(|e| anyhow::anyhow!("failed to build the client certificate verifier: {e}"))?;
+
+    Ok(ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?)
 }
 
 /// Creates a TLS ClientConfig that uses the OS native certificate verifier.
@@ -2520,6 +2569,231 @@ mod tests {
 
         drop(lease);
         assert_eq!(manager.available_slots(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Client-facing TLS / mTLS
+    // ------------------------------------------------------------------
+
+    /// A CA plus a leaf certificate signed by it, as PEM.
+    struct TestPki {
+        ca_pem: String,
+        server_cert_pem: String,
+        server_key_pem: String,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    fn build_test_pki() -> TestPki {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+            KeyUsagePurpose,
+        };
+
+        let mut ca_params = CertificateParams::new(vec!["iron-veil-test-ca".to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.clone().self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        let mut client_params = CertificateParams::new(vec!["door".to_string()]).unwrap();
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &issuer).unwrap();
+
+        TestPki {
+            ca_pem: ca_cert.pem(),
+            server_cert_pem: server_cert.pem(),
+            server_key_pem: server_key.serialize_pem(),
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
+
+    fn write_temp(dir: &std::path::Path, name: &str, contents: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn tls_config_for(
+        dir: &std::path::Path,
+        pki: &TestPki,
+        client_ca: Option<&str>,
+        require: bool,
+    ) -> crate::config::TlsConfig {
+        crate::config::TlsConfig {
+            enabled: true,
+            cert_path: write_temp(dir, "server.crt", &pki.server_cert_pem),
+            key_path: write_temp(dir, "server.key", &pki.server_key_pem),
+            client_ca_path: client_ca.map(|s| s.to_string()),
+            require_client_cert: require,
+        }
+    }
+
+    fn acceptor_for(tls: &crate::config::TlsConfig) -> Result<TlsAcceptor> {
+        let certs = super::load_certs(&tls.cert_path)?;
+        let key = super::load_keys(&tls.key_path)?;
+        Ok(TlsAcceptor::from(Arc::new(super::build_client_tls_config(
+            tls, certs, key,
+        )?)))
+    }
+
+    /// Drive a real TLS handshake over an in-memory duplex, optionally with a
+    /// client certificate. Returns whether the handshake completed.
+    async fn tls_handshake_succeeds(
+        acceptor: TlsAcceptor,
+        ca_pem: &str,
+        client_identity: Option<(String, String)>,
+    ) -> bool {
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let builder = ClientConfig::builder().with_root_certificates(roots);
+        let client_config = match client_identity {
+            Some((cert_pem, key_pem)) => {
+                let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                    .map(|c| c.unwrap())
+                    .collect();
+                let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).unwrap();
+                builder.with_client_auth_cert(chain, key).unwrap()
+            }
+            None => builder.with_no_client_auth(),
+        };
+
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            // Hold the accepted stream for the life of the task: dropping it
+            // closes the duplex under the client.
+            acceptor.accept(server_io).await.map_err(|e| e.to_string())
+        });
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let domain = ServerName::try_from("localhost").unwrap();
+        // Bind the stream rather than discarding it — dropping the client half
+        // here closes the duplex before the server has read the client's
+        // Finished, and every handshake then "fails" with a broken pipe.
+        let client = connector.connect(domain, client_io).await;
+
+        // Both ends must agree. Under TLS 1.3 the client can complete its side
+        // before the server has validated the client certificate, so a rejected
+        // certificate shows up only as a server-side failure.
+        let server = server.await.unwrap();
+        if let Err(err) = &server {
+            eprintln!("server handshake failed: {err}");
+        }
+        if let Err(err) = &client {
+            eprintln!("client handshake failed: {err}");
+        }
+        server.is_ok() && client.is_ok()
+    }
+
+    #[tokio::test]
+    async fn test_tls_without_client_ca_admits_clients_with_no_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = build_test_pki();
+        let tls = tls_config_for(dir.path(), &pki, None, false);
+
+        assert!(
+            tls_handshake_succeeds(acceptor_for(&tls).unwrap(), &pki.ca_pem, None).await,
+            "the default (no mTLS) must keep working"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_required_client_cert_rejects_a_client_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = build_test_pki();
+        let ca_path = write_temp(dir.path(), "ca.crt", &pki.ca_pem);
+        let tls = tls_config_for(dir.path(), &pki, Some(&ca_path), true);
+
+        assert!(
+            !tls_handshake_succeeds(acceptor_for(&tls).unwrap(), &pki.ca_pem, None).await,
+            "require_client_cert must reject an unauthenticated client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_required_client_cert_accepts_a_cert_from_the_configured_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = build_test_pki();
+        let ca_path = write_temp(dir.path(), "ca.crt", &pki.ca_pem);
+        let tls = tls_config_for(dir.path(), &pki, Some(&ca_path), true);
+
+        assert!(
+            tls_handshake_succeeds(
+                acceptor_for(&tls).unwrap(),
+                &pki.ca_pem,
+                Some((pki.client_cert_pem.clone(), pki.client_key_pem.clone())),
+            )
+            .await,
+            "a client cert chaining to the configured CA must be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_client_cert_from_another_ca_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = build_test_pki();
+        let other = build_test_pki();
+        let ca_path = write_temp(dir.path(), "ca.crt", &pki.ca_pem);
+        let tls = tls_config_for(dir.path(), &pki, Some(&ca_path), true);
+
+        assert!(
+            !tls_handshake_succeeds(
+                acceptor_for(&tls).unwrap(),
+                &pki.ca_pem,
+                Some((other.client_cert_pem, other.client_key_pem)),
+            )
+            .await,
+            "a client cert from an unrelated CA must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optional_client_cert_admits_both_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pki = build_test_pki();
+        let ca_path = write_temp(dir.path(), "ca.crt", &pki.ca_pem);
+        let tls = tls_config_for(dir.path(), &pki, Some(&ca_path), false);
+
+        assert!(
+            tls_handshake_succeeds(acceptor_for(&tls).unwrap(), &pki.ca_pem, None).await,
+            "optional mTLS must still admit a client with no certificate"
+        );
+        assert!(
+            tls_handshake_succeeds(
+                acceptor_for(&tls).unwrap(),
+                &pki.ca_pem,
+                Some((pki.client_cert_pem.clone(), pki.client_key_pem.clone())),
+            )
+            .await,
+            "optional mTLS must accept a valid certificate"
+        );
+    }
+
+    #[test]
+    fn test_empty_client_ca_bundle_is_rejected_at_startup() {
+        // An empty CA file would build a verifier that trusts nothing, turning
+        // "require client certs" into "reject everyone" at connection time.
+        let dir = tempfile::tempdir().unwrap();
+        let pki = build_test_pki();
+        let ca_path = write_temp(dir.path(), "ca.crt", "");
+        let tls = tls_config_for(dir.path(), &pki, Some(&ca_path), true);
+
+        let err = match acceptor_for(&tls) {
+            Ok(_) => panic!("an empty CA bundle must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("no certificates"), "got: {err}");
     }
 
     #[test]

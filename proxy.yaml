@@ -32,6 +32,12 @@ tls:
   enabled: false
   cert_path: certs/server.crt
   key_path: certs/server.key
+  # Optional mTLS. Setting client_ca_path alone verifies a client certificate
+  # when one is presented but still admits clients without one, which is how
+  # you roll mTLS out without a flag day. Add require_client_cert: true to
+  # make it mandatory.
+  # client_ca_path: certs/client-ca.crt
+  # require_client_cert: false
 upstream_tls: false
 
 # MySQL authentication handling.

@@ -529,6 +529,19 @@ pub struct TlsConfig {
     pub enabled: bool,
     pub cert_path: String,
     pub key_path: String,
+
+    /// PEM bundle of CA certificates that a client certificate must chain to.
+    ///
+    /// Setting this alone enables *optional* mTLS: a client that presents a
+    /// certificate must present a valid one, but a client that presents none is
+    /// still admitted. Combine with `require_client_cert` to make it mandatory.
+    #[serde(default)]
+    pub client_ca_path: Option<String>,
+
+    /// Reject clients that do not present a certificate chaining to
+    /// `client_ca_path`. Off by default; requires `client_ca_path`.
+    #[serde(default)]
+    pub require_client_cert: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -619,6 +632,22 @@ impl AppConfig {
                         KNOWN_HEURISTIC_TYPES.join(", ")
                     );
                 }
+            }
+        }
+        if let Some(tls) = &self.tls {
+            // Silently admitting every client would be the opposite of what
+            // this setting says, so refuse the incoherent config outright.
+            if tls.require_client_cert && tls.client_ca_path.is_none() {
+                anyhow::bail!(
+                    "tls.require_client_cert is set but tls.client_ca_path is not: there is \
+                     no CA to verify client certificates against"
+                );
+            }
+            if tls.client_ca_path.is_some() && !tls.enabled {
+                anyhow::bail!(
+                    "tls.client_ca_path is set but tls.enabled is false: client certificates \
+                     are only verified on a TLS connection"
+                );
             }
         }
         Ok(())
