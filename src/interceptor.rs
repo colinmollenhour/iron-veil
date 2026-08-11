@@ -6,6 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use fake::Fake;
 use fake::faker::address::en::StreetName;
+use fake::faker::company::en::CompanyName;
 use fake::faker::creditcard::en::CreditCardNumber;
 use fake::faker::internet::en::SafeEmail;
 use fake::faker::lorem::en::Sentence;
@@ -30,11 +31,18 @@ fn generate_fake_data(strategy: &str, seed: u64) -> String {
             let street: String = StreetName().fake_with_rng(&mut rng);
             format!("{} {}", 100 + seed % 9900, street)
         }
+        // The name family is deliberately per-column rather than one "name"
+        // strategy: schemas that split a person across `firstname` and
+        // `lastname` would otherwise get a full name in each, which reads as
+        // corrupt data rather than as a pseudonym.
         "name" => {
             let first: String = FirstName().fake_with_rng(&mut rng);
             let last: String = LastName().fake_with_rng(&mut rng);
             format!("{} {}", first, last)
         }
+        "first_name" => FirstName().fake_with_rng(&mut rng),
+        "last_name" => LastName().fake_with_rng(&mut rng),
+        "company" => CompanyName().fake_with_rng(&mut rng),
         "text" => Sentence(3..8).fake_with_rng(&mut rng),
         "credit_card" => CreditCardNumber().fake_with_rng(&mut rng),
         "ssn" => format!("XXX-XX-{:04}", (seed % 10000)),
@@ -1397,6 +1405,102 @@ mod tests {
         assert!(
             !serialized.contains(email),
             "log ring must not retain pre-masking values"
+        );
+    }
+
+    /// Mask one value under one strategy, with an explicit deployment secret.
+    async fn mask_one(strategy: &str, secret: &str, value: &str) -> String {
+        let config = AppConfig {
+            masking_enabled: true,
+            masking_secret: Some(secret.to_string()),
+            rules: vec![MaskingRule {
+                table: None,
+                column: "c".to_string(),
+                strategy: strategy.to_string(),
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = MySqlAnonymizer::new(state, 1);
+        anonymizer
+            .on_column_definition(&mysql_column("c", "c", "t", "t"))
+            .await;
+
+        let row = ResultRow {
+            values: vec![Some(BytesMut::from(value.as_bytes()))],
+            sequence_id: 1,
+        };
+        let row = anonymizer.on_result_row(row).await.unwrap();
+        String::from_utf8(row.values[0].as_ref().unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_name_strategies_are_deterministic_per_input() {
+        // The point of a seeded fake over a constant: the same customer reads
+        // as the same person across every order, so "are these two orders the
+        // same customer" stays answerable on masked output.
+        for strategy in ["name", "first_name", "last_name", "company", "text"] {
+            let a = mask_one(strategy, "deployment-key", "Ariane Kowalczyk").await;
+            let b = mask_one(strategy, "deployment-key", "Ariane Kowalczyk").await;
+            assert_eq!(a, b, "{strategy} must be deterministic for one input");
+
+            let other = mask_one(strategy, "deployment-key", "Bartholomew Ferreira").await;
+            assert_ne!(a, other, "{strategy} must distinguish different customers");
+
+            assert_ne!(
+                a, "MASKED",
+                "{strategy} must not fall through to the constant"
+            );
+            assert_ne!(
+                a, "Ariane Kowalczyk",
+                "{strategy} must not pass the input through"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_name_strategies_are_keyed_by_the_deployment_secret() {
+        // Without this, the pseudonym for a known name is computable by anyone
+        // who has the binary.
+        let a = mask_one("name", "secret-a", "Ariane Kowalczyk").await;
+        let b = mask_one("name", "secret-b", "Ariane Kowalczyk").await;
+        assert_ne!(a, b, "the same input under different keys must differ");
+    }
+
+    #[tokio::test]
+    async fn test_name_strategies_produce_plausible_shapes() {
+        // A support agent reads these values, so they have to look like the
+        // thing they replaced rather than like a token.
+        let full = mask_one("name", "k", "Ariane Kowalczyk").await;
+        assert!(
+            full.split_whitespace().count() >= 2,
+            "name should look like a full name, got {full}"
+        );
+        assert!(
+            !full.chars().any(|c| c.is_ascii_digit()),
+            "name should not contain digits, got {full}"
+        );
+
+        // Split-name columns must not each receive a full name — that reads as
+        // corrupt data rather than a pseudonym.
+        let first = mask_one("first_name", "k", "Ariane").await;
+        assert_eq!(
+            first.split_whitespace().count(),
+            1,
+            "first_name should be a single token, got {first}"
+        );
+        let last = mask_one("last_name", "k", "Kowalczyk").await;
+        assert_eq!(
+            last.split_whitespace().count(),
+            1,
+            "last_name should be a single token, got {last}"
+        );
+
+        let text = mask_one("text", "k", "customer called about a late delivery").await;
+        assert!(!text.is_empty());
+        assert!(
+            text.split_whitespace().count() >= 3,
+            "text should read like free text, got {text}"
         );
     }
 

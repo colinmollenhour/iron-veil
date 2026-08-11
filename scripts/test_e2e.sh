@@ -122,9 +122,20 @@ rules:
   - table: users
     column: phone_number
     strategy: phone
+  - table: customers
+    column: firstname
+    strategy: first_name
+  - table: customers
+    column: lastname
+    strategy: last_name
+  - table: customers
+    column: company
+    strategy: company
 heuristics:
   enabled: true
   types: ["email", "phone", "ssn", "credit_card"]
+# Pin the key so deterministic-masking assertions are stable.
+masking_secret: e2e-deterministic-key
 EOF
     log_info "Generated e2e proxy config: $E2E_CONFIG"
 }
@@ -636,6 +647,21 @@ CREATE TABLE orders (
 );
 INSERT INTO orders (buyer_email, card_number, status) VALUES
     ('buyer@shop.com', '4111-1111-1111-1111', 'completed');
+
+-- Name / free-text masking and alias-bypass coverage.
+-- Two rows share a customer so deterministic masking can be asserted:
+-- the same input must yield the same fake in both rows.
+DROP TABLE IF EXISTS customers;
+CREATE TABLE customers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    firstname VARCHAR(100),
+    lastname VARCHAR(100),
+    company VARCHAR(100),
+    notes TEXT
+);
+INSERT INTO customers (firstname, lastname, company, notes) VALUES
+    ('Ariane', 'Kowalczyk', 'Baker LLC', 'reach at ariane.k@corp.example about the late pallet'),
+    ('Ariane', 'Kowalczyk', 'Baker LLC', 'second order, same customer');
 EOF
 
     log_success "MySQL seeded with test data"
@@ -810,7 +836,61 @@ run_mysql_tests() {
     assert_masked 1 "buyer@shop.com" "MySQL Heuristic: Email detected and masked"
     assert_masked 1 "4111-1111-1111-1111" "MySQL Heuristic: Credit card detected and masked"
 
-    # Test 3: the audit path must not re-serve what the proxy just masked.
+    # Test 3: rules key off org_name/org_table, so an alias cannot hide a
+    # protected source column. This is the A4/A5 class of Phase 0 bypass.
+    log_section "Test: Rules Match Through Aliases (org_name / org_table)"
+    run_query_mysql "SELECT u.email AS contact FROM users u;"
+    assert_masked 1 "mysql.user@test.com" "Alias on the column does not bypass the rule"
+
+    run_query_mysql "SELECT email FROM users AS u2;"
+    assert_masked 1 "mysql.user@test.com" "Alias on the table does not bypass the rule"
+
+    # Test 4: heuristics are unanchored for email and phone, so PII embedded in
+    # a derived or concatenated string is still caught (the E2/E6 class).
+    log_section "Test: PII Embedded In Derived Strings Is Masked"
+    run_query_mysql "SELECT CONCAT('contact ', email, ' now') FROM users;"
+    assert_masked 1 "mysql.user@test.com" "Email inside a CONCAT is masked"
+
+    run_query_mysql "SELECT GROUP_CONCAT(buyer_email) FROM orders;"
+    assert_masked 1 "buyer@shop.com" "Email inside GROUP_CONCAT is masked"
+
+    run_query_mysql "SELECT notes FROM customers WHERE id = 1;"
+    assert_masked 1 "ariane.k@corp.example" "Email inside free text is masked"
+
+    # Test 5: the highest-value feature ask — the same customer must read as
+    # the same (fake) person across rows, or cross-order reasoning breaks.
+    log_section "Test: Deterministic Fake Names Preserve Same-Customer Reasoning"
+    run_query_mysql "SELECT firstname, lastname, company FROM customers ORDER BY id;"
+    if [ "$QUERY_OK" != true ]; then
+        log_error "Deterministic names: query failed: $QUERY_OUTPUT"
+    else
+        local first_row second_row
+        first_row=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '1p')
+        second_row=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '2p')
+
+        if printf '%s' "$QUERY_OUTPUT" | grep -qF "Ariane" \
+            || printf '%s' "$QUERY_OUTPUT" | grep -qF "Kowalczyk" \
+            || printf '%s' "$QUERY_OUTPUT" | grep -qF "Baker LLC"; then
+            log_error "Deterministic names: real name leaked: $QUERY_OUTPUT"
+        else
+            log_success "Deterministic names: real names masked"
+        fi
+
+        if [ -n "$first_row" ] && [ "$first_row" = "$second_row" ]; then
+            log_success "Deterministic names: same customer reads identically across rows"
+        else
+            log_error "Deterministic names: rows differ ('$first_row' vs '$second_row')"
+        fi
+
+        # ...and it is not the old constant, which destroyed that reasoning.
+        if printf '%s' "$first_row" | grep -qF "MASKED"; then
+            log_error "Deterministic names: fell through to the MASKED constant"
+        else
+            log_success "Deterministic names: produced a realistic fake, not a constant"
+        fi
+    fi
+
+    # Test 6: the audit path must not re-serve what the proxy just masked.
     # A masking proxy whose GET /logs hands back the cleartext defeats itself
     # (audit B2), so assert it on the wire after real masked queries.
     log_section "Test: Audit Path Carries No Pre-Masking Data"
@@ -823,7 +903,8 @@ run_mysql_tests() {
     else
         local leaked=false
         for pii in "mysql.user@test.com" "555-111-2222" "buyer@shop.com" \
-                   "4111-1111-1111-1111" "1600 Pennsylvania Avenue"; do
+                   "4111-1111-1111-1111" "1600 Pennsylvania Avenue" \
+                   "Ariane" "Kowalczyk" "ariane.k@corp.example"; do
             if printf '%s' "$logs" | grep -qF "$pii"; then
                 log_error "Audit path: GET /logs leaked pre-masking value '$pii'"
                 leaked=true
