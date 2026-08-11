@@ -259,6 +259,33 @@ wait_for_port() {
     return 0
 }
 
+# Wait until a database container will actually answer a query over TCP.
+#
+# A published port is NOT readiness. The official postgres and mysql images
+# start a temporary server to run initialisation and then restart it; a seed
+# sent between the two dies with "terminating connection due to administrator
+# command" and the tables silently never exist. That surfaces much later as
+# "relation does not exist" in a masking test, which reads like a proxy bug.
+#
+# The probe deliberately goes over 127.0.0.1 inside the container rather than
+# the unix socket: during initialisation the temporary server does not listen
+# on TCP, which is exactly the state we need to wait out.
+wait_for_db_ready() {
+    local container=$1 name=$2
+    shift 2
+    local attempt=0
+    while ! docker exec "$container" "$@" > /dev/null 2>&1; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 90 ]; then
+            log_error "$name never accepted a query"
+            return 1
+        fi
+        sleep 1
+    done
+    log_success "$name is accepting queries"
+    return 0
+}
+
 start_proxy() {
     # Args are forwarded verbatim to iron-veil; config is always the e2e config
     ./target/release/iron-veil --config "$E2E_CONFIG" "$@" &
@@ -497,11 +524,17 @@ setup_postgres() {
         log_error "Failed to start PostgreSQL"
         return 1
     fi
-    sleep 2  # Extra time for PG to fully initialize
+    if ! wait_for_db_ready pg-test "PostgreSQL" \
+        env PGPASSWORD=password psql -h 127.0.0.1 -U postgres -tAc "SELECT 1"; then
+        return 1
+    fi
 
     log_section "Seeding PostgreSQL test data..."
 
-    docker exec -i pg-test psql -U postgres <<'EOF'
+    # ON_ERROR_STOP so a failed statement is a failed seed, and the result is
+    # checked: this used to log success unconditionally, so an empty database
+    # was only discovered as a masking failure several tests later.
+    if ! docker exec -i pg-test psql -v ON_ERROR_STOP=1 -U postgres <<'EOF'
 -- Table with explicit masking rules
 DROP TABLE IF EXISTS users;
 CREATE TABLE users (
@@ -546,6 +579,11 @@ CREATE TABLE tags (
 INSERT INTO tags (values) VALUES
     (ARRAY['normal_tag', 'array@email.com', '4111-1111-1111-1111']);
 EOF
+
+    then
+        log_error "Failed to seed PostgreSQL"
+        return 1
+    fi
 
     log_success "PostgreSQL seeded with test data"
 }
@@ -616,16 +654,19 @@ setup_mysql() {
         --default-authentication-plugin=mysql_native_password > /dev/null
 
     log_info "Waiting for MySQL to initialize (this takes ~30s)..."
-    sleep 30
 
     if ! wait_for_port "$MYSQL_PORT" "MySQL"; then
         log_error "Failed to start MySQL"
         return 1
     fi
+    if ! wait_for_db_ready mysql-test "MySQL" \
+        mysql -h 127.0.0.1 -uroot -ppassword -e "SELECT 1"; then
+        return 1
+    fi
 
     log_section "Seeding MySQL test data..."
 
-    docker exec -i mysql-test mysql -uroot -ppassword testdb <<'EOF'
+    if ! docker exec -i mysql-test mysql -uroot -ppassword testdb <<'EOF'
 -- Table with explicit masking rules
 DROP TABLE IF EXISTS users;
 CREATE TABLE users (
@@ -663,6 +704,11 @@ INSERT INTO customers (firstname, lastname, company, notes) VALUES
     ('Ariane', 'Kowalczyk', 'Baker LLC', 'reach at ariane.k@corp.example about the late pallet'),
     ('Ariane', 'Kowalczyk', 'Baker LLC', 'second order, same customer');
 EOF
+
+    then
+        log_error "Failed to seed MySQL"
+        return 1
+    fi
 
     log_success "MySQL seeded with test data"
 }
@@ -1044,7 +1090,11 @@ run_api_tests() {
     # Verify stats updated after query
     response=$(curl -s "http://localhost:$API_PORT/stats" || true)
     local total_queries
-    total_queries=$(echo "$response" | grep -o '"total":[0-9]*' | head -1 | grep -o '[0-9]*' || true)
+    # Scope the match to the queries object: the response is serialised with
+    # sorted keys, so the first bare "total" in it is masking.total, and this
+    # assertion was reading the wrong number entirely.
+    total_queries=$(printf '%s' "$response" \
+        | sed -n 's/.*"queries":{[^}]*"total":\([0-9]*\).*/\1/p')
 
     if [ -n "$total_queries" ] && [ "$total_queries" -ge 1 ]; then
         log_success "Stats shows query count >= 1 after SELECT query (got $total_queries)"

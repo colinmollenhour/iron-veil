@@ -821,7 +821,10 @@ mod shipped_configs {
     fn test_shipped_proxy_yaml_loads_and_validates() {
         let config = load("proxy.yaml");
         assert!(config.masking_enabled);
-        assert!(!config.rules.is_empty(), "the shipped config should demo rules");
+        assert!(
+            !config.rules.is_empty(),
+            "the shipped config should demo rules"
+        );
 
         // The documented sidecar knobs must actually be present and parsed,
         // not just mentioned in comments.
