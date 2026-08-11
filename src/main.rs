@@ -2837,13 +2837,12 @@ mod tests {
 
         // The server withholds both a client-owned shape bit and every bit the
         // proxy would otherwise add for its own handshake response.
-        let server = u32::MAX
-            & !(CLIENT_DEPRECATE_EOF
-                | CLIENT_PROTOCOL_41
-                | CLIENT_SECURE_CONNECTION
-                | CLIENT_PLUGIN_AUTH
-                | CLIENT_CONNECT_WITH_DB
-                | CLIENT_SSL);
+        let server = !(CLIENT_DEPRECATE_EOF
+            | CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_CONNECT_WITH_DB
+            | CLIENT_SSL);
         let caps = negotiate_upstream_capabilities(u32::MAX, server, true, true);
         assert_eq!(caps & !server, 0);
     }
