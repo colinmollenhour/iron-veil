@@ -804,3 +804,40 @@ mod codec_tests {
         }
     }
 }
+
+/// The repository ships two configs, and `AppConfig` uses
+/// `deny_unknown_fields`. A schema change that renames or removes a key would
+/// otherwise break the shipped artifacts silently — the Docker image and the
+/// compose stack both fail at startup, not in CI.
+mod shipped_configs {
+    use iron_veil::config::AppConfig;
+
+    fn load(name: &str) -> AppConfig {
+        let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), name);
+        AppConfig::load(&path).unwrap_or_else(|e| panic!("{name} failed to load: {e}"))
+    }
+
+    #[test]
+    fn test_shipped_proxy_yaml_loads_and_validates() {
+        let config = load("proxy.yaml");
+        assert!(config.masking_enabled);
+        assert!(
+            !config.rules.is_empty(),
+            "the shipped config should demo rules"
+        );
+
+        // The documented sidecar knobs must actually be present and parsed,
+        // not just mentioned in comments.
+        let listen = config.listen.expect("proxy.yaml should document listen");
+        assert_eq!(listen.port, Some(6543));
+        let api = config.api.expect("proxy.yaml should document api");
+        assert!(api.enabled);
+        assert_eq!(api.bind.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_shipped_compose_config_loads_and_validates() {
+        let config = load("proxy.compose.yaml");
+        assert!(!config.rules.is_empty());
+    }
+}

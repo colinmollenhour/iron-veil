@@ -192,6 +192,11 @@ pub const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
 pub const CLIENT_CONNECT_ATTRS: u32 = 1 << 20;
 pub const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
 
+/// Status flag set in the OK packet the proxy issues when it terminates
+/// authentication itself. Clients read it to know autocommit is on, which it
+/// is — the proxy changes no session state.
+pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
+
 /// caching_sha2_password AuthMoreData status: fast path succeeded; server will
 /// send OK next without a client reply.
 pub const AUTH_MORE_DATA_FAST_AUTH_SUCCESS: u8 = 0x03;
@@ -225,6 +230,16 @@ pub enum MySqlState {
     WaitingHandshake,
     /// Waiting for client handshake response
     WaitingHandshakeResponse,
+    /// Mid-authentication, past the handshake response.
+    ///
+    /// Auth-exchange packets (AuthSwitchRequest, AuthMoreData, the client's
+    /// raw scramble or cleartext reply) carry no command byte, so they must not
+    /// be read through the `Command` dispatcher: a scramble whose first byte
+    /// happens to be 0x03 would be decoded as COM_QUERY, and a 0xFE
+    /// AuthSwitchRequest as a legacy EOF. This state hands back everything
+    /// except OK/ERR verbatim and leaves the auth loop in charge of when the
+    /// exchange is over.
+    WaitingAuthResponse,
     /// Normal command phase
     Command,
     /// Reading column definitions in result set
@@ -317,6 +332,13 @@ impl MySqlCodec {
     /// every client command so a desynced response stream cannot persist).
     pub fn set_command_state(&mut self) {
         self.state = MySqlState::Command;
+    }
+
+    /// Put the codec into the authentication exchange, where packets are
+    /// handed back verbatim rather than interpreted as commands or result-set
+    /// parts. Used by the terminating-auth path on both legs.
+    pub fn set_auth_response_state(&mut self) {
+        self.state = MySqlState::WaitingAuthResponse;
     }
 
     #[cfg(test)]
@@ -453,6 +475,35 @@ impl MySqlCodec {
                         }
                     }
                 }
+            }
+            MySqlState::WaitingAuthResponse => {
+                // Only the upstream-facing codec receives server OK/ERR packets.
+                // Client auth replies are opaque scrambles or passwords whose
+                // first byte can legitimately be 0x00 or 0xff.
+                if self.is_client_side {
+                    match packet.first().copied() {
+                        Some(0x00) => {
+                            if let Ok(ok) =
+                                parse_ok_packet(&packet, sequence_id, self.capability_flags)
+                            {
+                                self.state = MySqlState::Command;
+                                return Ok(Some(MySqlMessage::Ok(ok)));
+                            }
+                        }
+                        Some(0xff) => {
+                            if let Ok(err) =
+                                parse_err_packet(&packet, sequence_id, self.capability_flags)
+                            {
+                                return Ok(Some(MySqlMessage::Err(err)));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(MySqlMessage::Generic(GenericPacket {
+                    sequence_id,
+                    payload: packet,
+                })))
             }
             MySqlState::Command => {
                 if packet.is_empty() {
@@ -1107,17 +1158,14 @@ fn encode_handshake_v10(h: &HandshakeV10, dst: &mut BytesMut) {
     dst.put_slice(&payload);
 }
 
-fn encode_handshake_response(r: &HandshakeResponse, dst: &mut BytesMut) {
-    // Forward the client's packet byte-for-byte. Rebuilding it from parsed fields loses the
-    // CLIENT_CONNECT_ATTRS block (and mis-handles CLIENT_CONNECT_WITH_DB, which this parser
-    // infers from "are there bytes left" rather than from the capability bit), which the
-    // server rejects with ER_HANDSHAKE_ERROR.
-    if !r.raw.is_empty() {
-        write_packet_header(dst, r.raw.len(), 1);
-        dst.put_slice(&r.raw);
-        return;
-    }
-
+/// Build a handshake-response *payload*, without the packet header.
+///
+/// Exposed separately from `encode_handshake_response` because the sequence id
+/// is not fixed: it is 1 on a plain connection but 2 when an SSLRequest went
+/// first, and MySQL rejects a mismatch with ER_NET_PACKETS_OUT_OF_ORDER. Only
+/// callers that construct their own response (the terminating-auth path) need
+/// this; forwarding a client's response reuses its raw bytes.
+pub fn build_handshake_response_payload(r: &HandshakeResponse) -> BytesMut {
     let mut payload = BytesMut::new();
     payload.put_u32_le(r.capability_flags);
     payload.put_u32_le(r.max_packet_size);
@@ -1134,16 +1182,31 @@ fn encode_handshake_response(r: &HandshakeResponse, dst: &mut BytesMut) {
         payload.put_u8(0);
     }
 
-    if let Some(ref db) = r.database {
-        payload.put_slice(db.as_bytes());
+    if r.capability_flags & CLIENT_CONNECT_WITH_DB != 0 {
+        payload.put_slice(r.database.as_deref().unwrap_or_default().as_bytes());
         payload.put_u8(0);
     }
 
-    if let Some(ref plugin) = r.auth_plugin_name {
-        payload.put_slice(plugin.as_bytes());
+    if r.capability_flags & CLIENT_PLUGIN_AUTH != 0 {
+        payload.put_slice(r.auth_plugin_name.as_deref().unwrap_or_default().as_bytes());
         payload.put_u8(0);
     }
 
+    payload
+}
+
+fn encode_handshake_response(r: &HandshakeResponse, dst: &mut BytesMut) {
+    // Forward the client's packet byte-for-byte. Rebuilding it from parsed fields loses the
+    // CLIENT_CONNECT_ATTRS block (and mis-handles CLIENT_CONNECT_WITH_DB, which this parser
+    // infers from "are there bytes left" rather than from the capability bit), which the
+    // server rejects with ER_HANDSHAKE_ERROR.
+    if !r.raw.is_empty() {
+        write_packet_header(dst, r.raw.len(), 1);
+        dst.put_slice(&r.raw);
+        return;
+    }
+
+    let payload = build_handshake_response_payload(r);
     write_packet_header(dst, payload.len(), 1);
     dst.put_slice(&payload);
 }
@@ -1453,6 +1516,24 @@ mod tests {
         out_codec.set_capability_flags(CLIENT_PROTOCOL_41);
         let encoded = encode_one(&mut out_codec, MySqlMessage::Ok(ok));
         assert_eq!(encoded, bytes, "OK packet must round-trip verbatim");
+    }
+
+    #[test]
+    fn test_client_auth_replies_starting_with_ok_or_err_bytes_stay_opaque() {
+        for leading_byte in [0x00, 0xff] {
+            let mut payload = [0u8; 20];
+            payload[0] = leading_byte;
+            let bytes = packet(&payload, 2);
+
+            let mut codec = MySqlCodec::new_server();
+            codec.set_capability_flags(CLIENT_PROTOCOL_41);
+            codec.set_auth_response_state();
+
+            let MySqlMessage::Generic(reply) = decode_one(&mut codec, &bytes) else {
+                panic!("client auth reply starting with {leading_byte:#04x} was parsed");
+            };
+            assert_eq!(&reply.payload[..], payload);
+        }
     }
 
     #[test]

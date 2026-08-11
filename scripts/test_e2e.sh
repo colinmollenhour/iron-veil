@@ -46,6 +46,7 @@ QUERY_OUTPUT=""
 # The suite does not depend on the shipped proxy.yaml (its demo rules change
 # independently); it generates its own config below.
 E2E_CONFIG=""
+TERMINATE_CONFIG=""
 
 #######################################
 # Helper Functions
@@ -121,9 +122,20 @@ rules:
   - table: users
     column: phone_number
     strategy: phone
+  - table: customers
+    column: firstname
+    strategy: first_name
+  - table: customers
+    column: lastname
+    strategy: last_name
+  - table: customers
+    column: company
+    strategy: company
 heuristics:
   enabled: true
   types: ["email", "phone", "ssn", "credit_card"]
+# Pin the key so deterministic-masking assertions are stable.
+masking_secret: e2e-deterministic-key
 EOF
     log_info "Generated e2e proxy config: $E2E_CONFIG"
 }
@@ -247,6 +259,33 @@ wait_for_port() {
     return 0
 }
 
+# Wait until a database container will actually answer a query over TCP.
+#
+# A published port is NOT readiness. The official postgres and mysql images
+# start a temporary server to run initialisation and then restart it; a seed
+# sent between the two dies with "terminating connection due to administrator
+# command" and the tables silently never exist. That surfaces much later as
+# "relation does not exist" in a masking test, which reads like a proxy bug.
+#
+# The probe deliberately goes over 127.0.0.1 inside the container rather than
+# the unix socket: during initialisation the temporary server does not listen
+# on TCP, which is exactly the state we need to wait out.
+wait_for_db_ready() {
+    local container=$1 name=$2
+    shift 2
+    local attempt=0
+    while ! docker exec "$container" "$@" > /dev/null 2>&1; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 90 ]; then
+            log_error "$name never accepted a query"
+            return 1
+        fi
+        sleep 1
+    done
+    log_success "$name is accepting queries"
+    return 0
+}
+
 start_proxy() {
     # Args are forwarded verbatim to iron-veil; config is always the e2e config
     ./target/release/iron-veil --config "$E2E_CONFIG" "$@" &
@@ -279,9 +318,12 @@ cleanup() {
     docker rm -f pg-test mysql-test 2>/dev/null || true
     log_info "Removed test containers"
 
-    # Remove generated config
+    # Remove generated configs
     if [ -n "$E2E_CONFIG" ]; then
         rm -f "$E2E_CONFIG"
+    fi
+    if [ -n "$TERMINATE_CONFIG" ]; then
+        rm -f "$TERMINATE_CONFIG"
     fi
 }
 trap cleanup EXIT
@@ -338,6 +380,89 @@ test_graceful_shutdown() {
     else
         log_error "Graceful shutdown: Unexpected exit code $exit_code"
     fi
+}
+
+#######################################
+# Listener Configuration Tests
+#######################################
+
+# The sidecar posture depends on both listeners being pinnable to loopback and
+# on the management API being removable outright. Assert the wire behaviour,
+# not just that the flags parse.
+test_listener_configuration() {
+    log_section "Test: Listen Address / Management API Toggles"
+
+    # 1. --no-api must leave nothing listening on the API port at all.
+    ./target/release/iron-veil \
+        --config "$E2E_CONFIG" \
+        --port "$GRACEFUL_TEST_PORT" \
+        --upstream-host localhost \
+        --upstream-port "$PG_PORT" \
+        --protocol postgres \
+        --no-api &
+    local pid=$!
+    sleep 2
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log_error "--no-api: proxy failed to start"
+    else
+        if tcp_port_open localhost "$API_PORT"; then
+            log_error "--no-api: management API is still listening on $API_PORT"
+        else
+            log_success "--no-api: no management API listener"
+        fi
+        if tcp_port_open localhost "$GRACEFUL_TEST_PORT"; then
+            log_success "--no-api: proxy listener still serving"
+        else
+            log_error "--no-api: proxy listener is not serving"
+        fi
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    # 2. IRONVEIL_BIND / IRONVEIL_PORT must be honoured with no CLI flags.
+    IRONVEIL_BIND=127.0.0.1 IRONVEIL_PORT="$GRACEFUL_TEST_PORT" \
+    IRONVEIL_API_ENABLED=false \
+        ./target/release/iron-veil \
+            --config "$E2E_CONFIG" \
+            --upstream-host localhost \
+            --upstream-port "$PG_PORT" \
+            --protocol postgres &
+    pid=$!
+    sleep 2
+
+    if tcp_port_open localhost "$GRACEFUL_TEST_PORT"; then
+        log_success "IRONVEIL_BIND/IRONVEIL_PORT honoured without CLI flags"
+    else
+        log_error "IRONVEIL_BIND/IRONVEIL_PORT were not honoured"
+    fi
+    if tcp_port_open localhost "$API_PORT"; then
+        log_error "IRONVEIL_API_ENABLED=false: management API is still listening"
+    else
+        log_success "IRONVEIL_API_ENABLED=false disables the management API"
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    # 3. An explicit CLI flag must beat the environment.
+    IRONVEIL_PORT=1 \
+        ./target/release/iron-veil \
+            --config "$E2E_CONFIG" \
+            --port "$GRACEFUL_TEST_PORT" \
+            --upstream-host localhost \
+            --upstream-port "$PG_PORT" \
+            --api-port "$GRACEFUL_API_PORT" \
+            --protocol postgres &
+    pid=$!
+    sleep 2
+
+    if tcp_port_open localhost "$GRACEFUL_TEST_PORT"; then
+        log_success "--port overrides IRONVEIL_PORT"
+    else
+        log_error "--port did not override IRONVEIL_PORT"
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 }
 
 #######################################
@@ -399,11 +524,17 @@ setup_postgres() {
         log_error "Failed to start PostgreSQL"
         return 1
     fi
-    sleep 2  # Extra time for PG to fully initialize
+    if ! wait_for_db_ready pg-test "PostgreSQL" \
+        env PGPASSWORD=password psql -h 127.0.0.1 -U postgres -tAc "SELECT 1"; then
+        return 1
+    fi
 
     log_section "Seeding PostgreSQL test data..."
 
-    docker exec -i pg-test psql -U postgres <<'EOF'
+    # ON_ERROR_STOP so a failed statement is a failed seed, and the result is
+    # checked: this used to log success unconditionally, so an empty database
+    # was only discovered as a masking failure several tests later.
+    if ! docker exec -i pg-test psql -v ON_ERROR_STOP=1 -U postgres <<'EOF'
 -- Table with explicit masking rules
 DROP TABLE IF EXISTS users;
 CREATE TABLE users (
@@ -448,6 +579,11 @@ CREATE TABLE tags (
 INSERT INTO tags (values) VALUES
     (ARRAY['normal_tag', 'array@email.com', '4111-1111-1111-1111']);
 EOF
+
+    then
+        log_error "Failed to seed PostgreSQL"
+        return 1
+    fi
 
     log_success "PostgreSQL seeded with test data"
 }
@@ -518,16 +654,19 @@ setup_mysql() {
         --default-authentication-plugin=mysql_native_password > /dev/null
 
     log_info "Waiting for MySQL to initialize (this takes ~30s)..."
-    sleep 30
 
     if ! wait_for_port "$MYSQL_PORT" "MySQL"; then
         log_error "Failed to start MySQL"
         return 1
     fi
+    if ! wait_for_db_ready mysql-test "MySQL" \
+        mysql -h 127.0.0.1 -uroot -ppassword -e "SELECT 1"; then
+        return 1
+    fi
 
     log_section "Seeding MySQL test data..."
 
-    docker exec -i mysql-test mysql -uroot -ppassword testdb <<'EOF'
+    if ! docker exec -i mysql-test mysql -uroot -ppassword testdb <<'EOF'
 -- Table with explicit masking rules
 DROP TABLE IF EXISTS users;
 CREATE TABLE users (
@@ -549,9 +688,170 @@ CREATE TABLE orders (
 );
 INSERT INTO orders (buyer_email, card_number, status) VALUES
     ('buyer@shop.com', '4111-1111-1111-1111', 'completed');
+
+-- Name / free-text masking and alias-bypass coverage.
+-- Two rows share a customer so deterministic masking can be asserted:
+-- the same input must yield the same fake in both rows.
+DROP TABLE IF EXISTS customers;
+CREATE TABLE customers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    firstname VARCHAR(100),
+    lastname VARCHAR(100),
+    company VARCHAR(100),
+    notes TEXT
+);
+INSERT INTO customers (firstname, lastname, company, notes) VALUES
+    ('Ariane', 'Kowalczyk', 'Baker LLC', 'reach at ariane.k@corp.example about the late pallet'),
+    ('Ariane', 'Kowalczyk', 'Baker LLC', 'second order, same customer');
 EOF
 
+    then
+        log_error "Failed to seed MySQL"
+        return 1
+    fi
+
     log_success "MySQL seeded with test data"
+}
+
+#######################################
+# MySQL Terminating Authentication (B-3)
+#######################################
+
+# Config for auth.mode: terminate. The proxy holds the real upstream
+# credential (root/password) and authenticates clients against a throwaway
+# local one, so the client credential is good for nothing but this hop.
+write_terminate_config() {
+    TERMINATE_CONFIG="$(mktemp -t ironveil-e2e-terminate.XXXXXX)"
+    cat > "$TERMINATE_CONFIG" <<'EOF'
+masking_enabled: true
+upstream_tls: false
+auth:
+  mode: terminate
+  client_username: door
+  client_password: door-throwaway
+  upstream_username: root
+  upstream_password: password
+  upstream_database: testdb
+rules:
+  - table: users
+    column: email
+    strategy: email
+  - table: users
+    column: phone_number
+    strategy: phone
+heuristics:
+  enabled: true
+  types: ["email", "phone", "ssn", "credit_card"]
+EOF
+    log_info "Generated terminate-mode config: $TERMINATE_CONFIG"
+}
+
+# Run a query as the throwaway client credential rather than the DB one.
+run_query_mysql_as() {
+    local user="$1" password="$2" sql="$3"
+    QUERY_OK=false
+    QUERY_OUTPUT=""
+    local err
+    err=$(mktemp -t ironveil-mysql-err.XXXXXX)
+    if QUERY_OUTPUT=$(docker run --rm "$MYSQL_IMAGE" \
+        mysql -h "$DOCKER_HOST_ADDR" -P "$PROXY_PORT" -u"$user" -p"$password" testdb \
+        --skip-column-names -e "$sql" 2>"$err"); then
+        QUERY_OK=true
+    else
+        QUERY_OUTPUT=$(cat "$err")
+    fi
+    rm -f "$err"
+}
+
+run_mysql_terminate_auth_tests() {
+    log_header "MySQL Terminating Authentication"
+
+    if ! docker ps | grep -q mysql-test; then
+        setup_mysql || return 1
+    fi
+    write_terminate_config
+
+    log_section "Starting IronVeil proxy (MySQL, auth.mode: terminate)..."
+    ./target/release/iron-veil --config "$TERMINATE_CONFIG" \
+        --port "$PROXY_PORT" --upstream-host localhost --upstream-port "$MYSQL_PORT" \
+        --api-port "$API_PORT" --protocol mysql &
+    PROXY_PID=$!
+
+    if ! wait_for_port "$PROXY_PORT" "IronVeil Proxy"; then
+        log_error "Failed to start proxy in terminate mode"
+        return 1
+    fi
+    sleep 2
+
+    # 1. The throwaway local credential gets in. This exercises the whole
+    #    path: the proxy serves its own caching_sha2_password handshake and
+    #    verifies fast auth from the configured cleartext password, then
+    #    authenticates upstream itself as root over mysql_native_password.
+    log_section "Test: Local Credential Authenticates"
+    run_query_mysql_as door door-throwaway "SELECT 1;"
+    if [ "$QUERY_OK" = true ]; then
+        log_success "Terminate: throwaway client credential authenticated"
+    else
+        log_error "Terminate: client credential rejected: $QUERY_OUTPUT"
+    fi
+
+    # 2. The real upstream credential must NOT work against the proxy. This is
+    #    the whole point of the mode: the exposed port no longer accepts the
+    #    database password, so a compromised client cannot replay it upstream.
+    log_section "Test: Upstream Credential Is Not Accepted By The Proxy"
+    run_query_mysql_as root password "SELECT 1;"
+    if [ "$QUERY_OK" = true ]; then
+        log_error "Terminate: upstream DB credential was accepted by the proxy"
+    else
+        log_success "Terminate: upstream DB credential rejected at the proxy"
+    fi
+
+    # 3. A wrong password for the right user is denied.
+    log_section "Test: Wrong Password Is Denied"
+    run_query_mysql_as door not-the-password "SELECT 1;"
+    if [ "$QUERY_OK" = true ]; then
+        log_error "Terminate: wrong password was accepted"
+    else
+        if printf '%s' "$QUERY_OUTPUT" | grep -qi "access denied"; then
+            log_success "Terminate: wrong password denied with ER_ACCESS_DENIED"
+        else
+            log_error "Terminate: wrong password rejected, but not cleanly: $QUERY_OUTPUT"
+        fi
+    fi
+
+    # 4. Masking must behave identically to passthrough mode — terminating auth
+    #    changes who authenticates, not what the result set looks like.
+    log_section "Test: Masking Still Applies In Terminate Mode"
+    run_query_mysql_as door door-throwaway "SELECT email, phone_number FROM users;"
+    assert_masked 1 "mysql.user@test.com" "Terminate: email masked"
+    assert_masked 1 "555-111-2222" "Terminate: phone masked"
+
+    run_query_mysql_as door door-throwaway "SELECT buyer_email, card_number FROM orders;"
+    assert_masked 1 "buyer@shop.com" "Terminate: heuristic email masked"
+    assert_masked 1 "4111-1111-1111-1111" "Terminate: heuristic credit card masked"
+
+    # 5. Multi-row result sets exercise the terminator handling under the
+    #    capability flags the proxy negotiated on the client's behalf.
+    log_section "Test: Result Set Shape Survives Negotiated Capabilities"
+    run_query_mysql_as door door-throwaway \
+        "SELECT id FROM users UNION ALL SELECT id FROM orders UNION ALL SELECT 99;"
+    if [ "$QUERY_OK" = true ]; then
+        local rows
+        rows=$(printf '%s\n' "$QUERY_OUTPUT" | sed -e '/^[[:space:]]*$/d' | wc -l)
+        if [ "$rows" -eq 3 ]; then
+            log_success "Terminate: multi-row result set intact ($rows rows)"
+        else
+            log_error "Terminate: expected 3 rows, got $rows: $QUERY_OUTPUT"
+        fi
+    else
+        log_error "Terminate: multi-row query failed: $QUERY_OUTPUT"
+    fi
+
+    kill "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=""
+    rm -f "$TERMINATE_CONFIG"
+    TERMINATE_CONFIG=""
+    sleep 1
 }
 
 run_mysql_tests() {
@@ -581,6 +881,92 @@ run_mysql_tests() {
     echo "$QUERY_OUTPUT"
     assert_masked 1 "buyer@shop.com" "MySQL Heuristic: Email detected and masked"
     assert_masked 1 "4111-1111-1111-1111" "MySQL Heuristic: Credit card detected and masked"
+
+    # Test 3: rules key off org_name/org_table, so an alias cannot hide a
+    # protected source column. This is the A4/A5 class of Phase 0 bypass.
+    log_section "Test: Rules Match Through Aliases (org_name / org_table)"
+    run_query_mysql "SELECT u.email AS contact FROM users u;"
+    assert_masked 1 "mysql.user@test.com" "Alias on the column does not bypass the rule"
+
+    run_query_mysql "SELECT email FROM users AS u2;"
+    assert_masked 1 "mysql.user@test.com" "Alias on the table does not bypass the rule"
+
+    # Test 4: heuristics are unanchored for email and phone, so PII embedded in
+    # a derived or concatenated string is still caught (the E2/E6 class).
+    log_section "Test: PII Embedded In Derived Strings Is Masked"
+    run_query_mysql "SELECT CONCAT('contact ', email, ' now') FROM users;"
+    assert_masked 1 "mysql.user@test.com" "Email inside a CONCAT is masked"
+
+    run_query_mysql "SELECT GROUP_CONCAT(buyer_email) FROM orders;"
+    assert_masked 1 "buyer@shop.com" "Email inside GROUP_CONCAT is masked"
+
+    run_query_mysql "SELECT notes FROM customers WHERE id = 1;"
+    assert_masked 1 "ariane.k@corp.example" "Email inside free text is masked"
+
+    # Test 5: the highest-value feature ask — the same customer must read as
+    # the same (fake) person across rows, or cross-order reasoning breaks.
+    log_section "Test: Deterministic Fake Names Preserve Same-Customer Reasoning"
+    run_query_mysql "SELECT firstname, lastname, company FROM customers ORDER BY id;"
+    if [ "$QUERY_OK" != true ]; then
+        log_error "Deterministic names: query failed: $QUERY_OUTPUT"
+    else
+        local first_row second_row
+        first_row=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '1p')
+        second_row=$(printf '%s\n' "$QUERY_OUTPUT" | sed -n '2p')
+
+        if printf '%s' "$QUERY_OUTPUT" | grep -qF "Ariane" \
+            || printf '%s' "$QUERY_OUTPUT" | grep -qF "Kowalczyk" \
+            || printf '%s' "$QUERY_OUTPUT" | grep -qF "Baker LLC"; then
+            log_error "Deterministic names: real name leaked: $QUERY_OUTPUT"
+        else
+            log_success "Deterministic names: real names masked"
+        fi
+
+        if [ -n "$first_row" ] && [ "$first_row" = "$second_row" ]; then
+            log_success "Deterministic names: same customer reads identically across rows"
+        else
+            log_error "Deterministic names: rows differ ('$first_row' vs '$second_row')"
+        fi
+
+        # ...and it is not the old constant, which destroyed that reasoning.
+        if printf '%s' "$first_row" | grep -qF "MASKED"; then
+            log_error "Deterministic names: fell through to the MASKED constant"
+        else
+            log_success "Deterministic names: produced a realistic fake, not a constant"
+        fi
+    fi
+
+    # Test 6: the audit path must not re-serve what the proxy just masked.
+    # A masking proxy whose GET /logs hands back the cleartext defeats itself
+    # (audit B2), so assert it on the wire after real masked queries.
+    log_section "Test: Audit Path Carries No Pre-Masking Data"
+    run_query_mysql "SELECT email FROM users WHERE email = 'mysql.user@test.com';"
+    local logs
+    logs=$(curl -s "http://localhost:$API_PORT/logs" || true)
+
+    if [ -z "$logs" ]; then
+        log_error "Audit path: could not read GET /logs"
+    else
+        local leaked=false
+        for pii in "mysql.user@test.com" "555-111-2222" "buyer@shop.com" \
+                   "4111-1111-1111-1111" "1600 Pennsylvania Avenue" \
+                   "Ariane" "Kowalczyk" "ariane.k@corp.example"; do
+            if printf '%s' "$logs" | grep -qF "$pii"; then
+                log_error "Audit path: GET /logs leaked pre-masking value '$pii'"
+                leaked=true
+            fi
+        done
+        if [ "$leaked" = false ]; then
+            log_success "Audit path: GET /logs contains no pre-masking values"
+        fi
+
+        # ...and it is not empty-by-accident: the metadata must be there.
+        if printf '%s' "$logs" | grep -q "original_len"; then
+            log_success "Audit path: masking metadata still recorded"
+        else
+            log_error "Audit path: no masking metadata recorded (test proves nothing)"
+        fi
+    fi
 
     # Stop proxy
     kill "$PROXY_PID" 2>/dev/null || true
@@ -704,7 +1090,11 @@ run_api_tests() {
     # Verify stats updated after query
     response=$(curl -s "http://localhost:$API_PORT/stats" || true)
     local total_queries
-    total_queries=$(echo "$response" | grep -o '"total":[0-9]*' | head -1 | grep -o '[0-9]*' || true)
+    # Scope the match to the queries object: the response is serialised with
+    # sorted keys, so the first bare "total" in it is masking.total, and this
+    # assertion was reading the wrong number entirely.
+    total_queries=$(printf '%s' "$response" \
+        | sed -n 's/.*"queries":{[^}]*"total":\([0-9]*\).*/\1/p')
 
     if [ -n "$total_queries" ] && [ "$total_queries" -ge 1 ]; then
         log_success "Stats shows query count >= 1 after SELECT query (got $total_queries)"
@@ -943,18 +1333,22 @@ main() {
             run_negative_tests
             run_connection_tests
             run_upstream_failure_tests
+            test_listener_configuration
             test_graceful_shutdown
             ;;
         mysql)
             run_mysql_tests
+            run_mysql_terminate_auth_tests
             ;;
         all)
             run_postgres_tests
             run_mysql_tests
+            run_mysql_terminate_auth_tests
             run_api_tests
             run_negative_tests
             run_connection_tests
             run_upstream_failure_tests
+            test_listener_configuration
             test_graceful_shutdown
             ;;
         *)

@@ -6,6 +6,7 @@ use anyhow::Result;
 use bytes::BytesMut;
 use fake::Fake;
 use fake::faker::address::en::StreetName;
+use fake::faker::company::en::CompanyName;
 use fake::faker::creditcard::en::CreditCardNumber;
 use fake::faker::internet::en::SafeEmail;
 use fake::faker::lorem::en::Sentence;
@@ -30,11 +31,18 @@ fn generate_fake_data(strategy: &str, seed: u64) -> String {
             let street: String = StreetName().fake_with_rng(&mut rng);
             format!("{} {}", 100 + seed % 9900, street)
         }
+        // The name family is deliberately per-column rather than one "name"
+        // strategy: schemas that split a person across `firstname` and
+        // `lastname` would otherwise get a full name in each, which reads as
+        // corrupt data rather than as a pseudonym.
         "name" => {
             let first: String = FirstName().fake_with_rng(&mut rng);
             let last: String = LastName().fake_with_rng(&mut rng);
             format!("{} {}", first, last)
         }
+        "first_name" => FirstName().fake_with_rng(&mut rng),
+        "last_name" => LastName().fake_with_rng(&mut rng),
+        "company" => CompanyName().fake_with_rng(&mut rng),
         "text" => Sentence(3..8).fake_with_rng(&mut rng),
         "credit_card" => CreditCardNumber().fake_with_rng(&mut rng),
         "ssn" => format!("XXX-XX-{:04}", (seed % 10000)),
@@ -227,6 +235,14 @@ struct CellChange {
     log: serde_json::Value,
 }
 
+/// Preview of a *fully replaced* cell — the generated fake, never the input.
+///
+/// Only safe when the whole value was substituted. Partial rewrites (JSON
+/// documents, arrays, embedded email/phone spans) leave the untouched
+/// remainder of the value in place, and that remainder is exactly the free
+/// text the heuristics could not attribute — so those paths report a marker
+/// instead. The log ring is re-served over GET /logs; it carries metadata and
+/// generated values, not result data.
 fn preview(value: &str) -> String {
     if value.len() > 50 {
         let mut end = 50;
@@ -351,7 +367,7 @@ fn mask_cell(
                     && trimmed.ends_with('}')
                     && let Some(masked_array) = mask_postgres_array(s, ctx)
                 {
-                    let log = change_record("array (heuristic)", preview(&masked_array));
+                    let log = change_record("array (heuristic)", "(array masked)".to_string());
                     val.clear();
                     val.extend_from_slice(masked_array.as_bytes());
                     return Some(CellChange {
@@ -385,7 +401,9 @@ fn mask_cell(
                 generate_fake_data(strat, masking_seed(&ctx.key, span.as_bytes()))
             })
     {
-        let log = change_record("span (heuristic)", preview(&masked));
+        // Only the matched spans were replaced; the rest of the cell is the
+        // original free text and must not be echoed into the log ring.
+        let log = change_record("span (heuristic)", "(spans masked)".to_string());
         val.clear();
         val.extend_from_slice(masked.as_bytes());
         return Some(CellChange {
@@ -1390,9 +1408,180 @@ mod tests {
         );
     }
 
+    /// Mask one value under one strategy, with an explicit deployment secret.
+    async fn mask_one(strategy: &str, secret: &str, value: &str) -> String {
+        let config = AppConfig {
+            masking_enabled: true,
+            masking_secret: Some(secret.to_string()),
+            rules: vec![MaskingRule {
+                table: None,
+                column: "c".to_string(),
+                strategy: strategy.to_string(),
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = MySqlAnonymizer::new(state, 1);
+        anonymizer
+            .on_column_definition(&mysql_column("c", "c", "t", "t"))
+            .await;
+
+        let row = ResultRow {
+            values: vec![Some(BytesMut::from(value.as_bytes()))],
+            sequence_id: 1,
+        };
+        let row = anonymizer.on_result_row(row).await.unwrap();
+        String::from_utf8(row.values[0].as_ref().unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_name_strategies_are_deterministic_per_input() {
+        // The point of a seeded fake over a constant: the same customer reads
+        // as the same person across every order, so "are these two orders the
+        // same customer" stays answerable on masked output.
+        for strategy in ["name", "first_name", "last_name", "company", "text"] {
+            let a = mask_one(strategy, "deployment-key", "Ariane Kowalczyk").await;
+            let b = mask_one(strategy, "deployment-key", "Ariane Kowalczyk").await;
+            assert_eq!(a, b, "{strategy} must be deterministic for one input");
+
+            let other = mask_one(strategy, "deployment-key", "Bartholomew Ferreira").await;
+            assert_ne!(a, other, "{strategy} must distinguish different customers");
+
+            assert_ne!(
+                a, "MASKED",
+                "{strategy} must not fall through to the constant"
+            );
+            assert_ne!(
+                a, "Ariane Kowalczyk",
+                "{strategy} must not pass the input through"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_name_strategies_are_keyed_by_the_deployment_secret() {
+        // Without this, the pseudonym for a known name is computable by anyone
+        // who has the binary.
+        let a = mask_one("name", "secret-a", "Ariane Kowalczyk").await;
+        let b = mask_one("name", "secret-b", "Ariane Kowalczyk").await;
+        assert_ne!(a, b, "the same input under different keys must differ");
+    }
+
+    #[tokio::test]
+    async fn test_name_strategies_produce_plausible_shapes() {
+        // A support agent reads these values, so they have to look like the
+        // thing they replaced rather than like a token.
+        let full = mask_one("name", "k", "Ariane Kowalczyk").await;
+        assert!(
+            full.split_whitespace().count() >= 2,
+            "name should look like a full name, got {full}"
+        );
+        assert!(
+            !full.chars().any(|c| c.is_ascii_digit()),
+            "name should not contain digits, got {full}"
+        );
+
+        // Split-name columns must not each receive a full name — that reads as
+        // corrupt data rather than a pseudonym.
+        let first = mask_one("first_name", "k", "Ariane").await;
+        assert_eq!(
+            first.split_whitespace().count(),
+            1,
+            "first_name should be a single token, got {first}"
+        );
+        let last = mask_one("last_name", "k", "Kowalczyk").await;
+        assert_eq!(
+            last.split_whitespace().count(),
+            1,
+            "last_name should be a single token, got {last}"
+        );
+
+        let text = mask_one("text", "k", "customer called about a late delivery").await;
+        assert!(!text.is_empty());
+        assert!(
+            text.split_whitespace().count() >= 3,
+            "text should read like free text, got {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_masking_never_echoes_the_untouched_remainder() {
+        // Span masking replaces only the matched email; the surrounding prose
+        // is original result data and must not reach the log ring (audit B2).
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = Anonymizer::new(state.clone(), 1);
+
+        let note = "refund for Ariane Kowalczyk, reach her at a.k@corp.example";
+        let row = DataRow {
+            values: vec![Some(BytesMut::from(note.as_bytes()))],
+        };
+        anonymizer.on_data_row(row).await.unwrap();
+
+        let logs = state.logs.read().await;
+        let serialized = serde_json::to_string(&*logs).unwrap();
+        assert!(
+            !serialized.contains("Ariane Kowalczyk"),
+            "log ring echoed unmasked free text: {serialized}"
+        );
+        assert!(
+            !serialized.contains("a.k@corp.example"),
+            "log ring echoed the pre-masking value: {serialized}"
+        );
+        assert!(
+            serialized.contains("(spans masked)"),
+            "expected a marker rather than a value preview: {serialized}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // MySQL anonymizer
     // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_mysql_masking_log_never_contains_original_value() {
+        // Mirror of the PostgreSQL guard: the MySQL path builds its own log
+        // entry, so it needs its own regression test.
+        let config = AppConfig {
+            masking_enabled: true,
+            rules: vec![MaskingRule {
+                table: None,
+                column: "email".to_string(),
+                strategy: "email".to_string(),
+            }],
+            ..Default::default()
+        };
+        let state = AppState::new_for_test(config, "proxy.yaml".to_string());
+        let mut anonymizer = MySqlAnonymizer::new(state.clone(), 1);
+
+        anonymizer
+            .on_column_definition(&mysql_column("email", "email", "users", "users"))
+            .await;
+
+        let secret = "super.secret@example.com";
+        let row = ResultRow {
+            values: vec![Some(BytesMut::from(secret.as_bytes()))],
+            sequence_id: 1,
+        };
+        anonymizer.on_result_row(row).await.unwrap();
+
+        let logs = state.logs.read().await;
+        let serialized = serde_json::to_string(&*logs).unwrap();
+        assert!(
+            !serialized.contains(secret),
+            "MySQL log ring must not retain pre-masking values: {serialized}"
+        );
+        // Metadata that is safe to keep is still there.
+        assert!(serialized.contains("original_len"), "got: {serialized}");
+        assert!(
+            serialized.contains("\"column_name\":\"email\""),
+            "got: {serialized}"
+        );
+    }
 
     #[tokio::test]
     async fn test_mysql_rule_matching_is_case_insensitive() {

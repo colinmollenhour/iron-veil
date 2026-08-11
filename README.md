@@ -13,7 +13,8 @@
 *   **Multi-Database Support**: Works with both **PostgreSQL** and **MySQL** wire protocols.
 *   **Zero-Copy Parsing**: Built with `tokio` and `bytes` for high throughput and low latency.
 *   **Configurable Rules**: Define masking strategies per column via `proxy.yaml` with table-scoped matching for MySQL and PostgreSQL.
-*   **TLS Support**: Client-to-proxy and proxy-to-upstream TLS on both protocols. `upstream_tls: true` is a requirement, not a preference — the proxy refuses the connection rather than falling back to cleartext.
+*   **TLS Support**: Client-to-proxy and proxy-to-upstream TLS on both protocols. `upstream_tls: true` is a requirement, not a preference — the proxy refuses the connection rather than falling back to cleartext. Optional mTLS verifies client certificates against a configured CA.
+*   **Credential Termination (MySQL)**: Optionally hold the upstream database credential inside the proxy and authenticate clients against a separate local one, so the process exposed to clients never handles the database password.
 
 ### PII Detection
 *   **Extended PII Types**: Detects emails, credit cards (Luhn-validated), SSNs, phone numbers, IP addresses, dates of birth and passport numbers; the ambiguous detectors are opt-in.
@@ -22,7 +23,8 @@
 *   **Keyed Deterministic Masking**: Same input produces the same fake output under a given `masking_secret`, without that mapping being reproducible by anyone who lacks the secret.
 
 ### Production Ready
-*   **Graceful Shutdown**: Signal handling (SIGTERM, SIGINT) with connection draining.
+*   **Graceful Shutdown**: SIGTERM/SIGINT stop the accept loop, drain in-flight connections within `--shutdown-timeout` and exit 0, so container stops and rollouts do not wait out the grace period.
+*   **Lockable Listen Surface**: Both listeners take a bind address from the CLI, the environment or the config file, and the management API can be switched off entirely.
 *   **API Authentication**: API key and JWT (HS256) authentication for management endpoints.
 *   **Connection Limits**: Max connections and rate limiting support.
 *   **Connection Timeouts**: Configurable idle and connect timeouts.
@@ -123,13 +125,69 @@ Options:
       --bind <BIND>                    Address the proxy listener binds to [default: 0.0.0.0]
       --api-port <API_PORT>            Management API port [default: 3001]
       --api-bind <API_BIND>            Address the management API binds to
-                                       [default: 127.0.0.1; overrides api.bind]
+                                       [default: 127.0.0.1]
+      --no-api                         Do not start the management API at all
       --protocol <PROTOCOL>            Database protocol to proxy [default: postgres]
                                        [possible values: postgres, mysql]
-      --shutdown-timeout <SECONDS>     Graceful shutdown timeout [default: 30]
+      --shutdown-timeout <SECONDS>     Graceful shutdown timeout [default: 10]
   -h, --help                           Print help
   -V, --version                        Print version
 ```
+
+### Where Settings Come From
+
+Listener settings can be given four ways. Precedence is uniform:
+
+**CLI flag > environment variable > config file > built-in default.**
+
+The CLI wins because it is the most explicit; the environment beats the config
+file so an image with a baked-in `proxy.yaml` can still be re-pointed at deploy
+time. An exported-but-empty environment variable counts as unset, so a blank
+value in a compose file does not silently shadow the config.
+
+| Setting | CLI | Environment | Config | Default |
+|---|---|---|---|---|
+| Proxy bind address | `--bind` | `IRONVEIL_BIND` | `listen.bind` | `0.0.0.0` |
+| Proxy port | `--port` | `IRONVEIL_PORT` | `listen.port` | `6543` |
+| API bind address | `--api-bind` | `IRONVEIL_API_BIND` | `api.bind` | `127.0.0.1` |
+| API port | `--api-port` | `IRONVEIL_API_PORT` | `api.port` | `3001` |
+| API enabled | `--no-api` | `IRONVEIL_API_ENABLED` | `api.enabled` | `true` |
+| Masking secret | — | `IRONVEIL_MASKING_SECRET` | `masking_secret` | random per process |
+
+Credentials for `auth.mode: terminate` follow a per-secret precedence of
+**environment > file > inline**, so a Kubernetes or Docker secret mount can
+supply the value without it appearing in the config:
+
+| Setting | Environment | Config |
+|---|---|---|
+| Client username | `IRONVEIL_CLIENT_USERNAME` | `auth.client_username` |
+| Client password | `IRONVEIL_CLIENT_PASSWORD` | `auth.client_password` / `auth.client_password_file` |
+| Upstream username | `IRONVEIL_UPSTREAM_USERNAME` | `auth.upstream_username` |
+| Upstream password | `IRONVEIL_UPSTREAM_PASSWORD` | `auth.upstream_password` / `auth.upstream_password_file` |
+
+### Recommended Settings For A Localhost Sidecar
+
+When iron-veil runs beside the only process that talks to it — sharing a
+network namespace, with that process being the one actually exposed — nothing
+should be reachable from outside the pod:
+
+```yaml
+listen:
+  bind: 127.0.0.1     # the masked port is never reachable off-host
+  port: 6543
+api:
+  enabled: false      # no HTTP control plane at all
+auth:
+  mode: terminate     # the exposed process never holds the DB credential
+upstream_tls: true    # required for a non-cached caching_sha2_password account
+```
+
+The management API is worth turning off rather than merely binding to
+loopback: it is a global masking kill-switch and it re-serves the log ring, so
+in a deployment that scrapes neither `/health` nor `/metrics` over HTTP it is
+pure attack surface. If you do need it, leave it on loopback and set an
+`api_key` — binding any non-loopback address without credentials is refused at
+startup.
 
 ## Configuration
 
@@ -161,8 +219,31 @@ tls:
   enabled: false
   cert_path: "certs/server.crt"
   key_path: "certs/server.key"
+  # Optional mTLS. client_ca_path alone verifies a client certificate when one
+  # is presented but still admits clients without one — the shape needed to
+  # roll mTLS out without a flag day. require_client_cert makes it mandatory
+  # and is refused at startup unless client_ca_path is also set.
+  client_ca_path: "certs/client-ca.crt"
+  require_client_cert: false
 
 upstream_tls: false
+
+# Where the proxy's own listener binds. Overridden by --bind/--port and by
+# IRONVEIL_BIND / IRONVEIL_PORT.
+listen:
+  bind: "0.0.0.0"
+  port: 6543
+
+# MySQL authentication handling. See "Authentication Modes" below.
+auth:
+  mode: passthrough       # or: terminate
+  # client_username: door
+  # client_password: local-throwaway
+  # client_password_file: /run/secrets/ironveil-client-password
+  # client_auth_plugin: caching_sha2_password   # or mysql_native_password
+  # upstream_username: support_ro
+  # upstream_password_file: /run/secrets/ironveil-upstream-password
+  # upstream_database: wms
 
 # OpenTelemetry (send traces to Jaeger, Grafana Tempo, etc.)
 telemetry:
@@ -172,11 +253,14 @@ telemetry:
 
 # Management API Security. The API binds 127.0.0.1 by default; binding any
 # other address requires api_key or jwt_secret, and the proxy refuses to start
-# otherwise (the API can globally disable masking).
+# otherwise (the API can globally disable masking). Set enabled: false to not
+# run it at all.
 api:
+  enabled: true
   api_key: "your-secret-key"  # Optional: protects endpoints via X-API-Key header
   jwt_secret: "your-jwt-secret"  # Optional: allows Authorization: Bearer <token>
   bind: "127.0.0.1"  # Optional: management API bind address
+  port: 3001  # Optional: management API port
   cors_origins: ["http://localhost:3000"]  # Optional: browser origins allowed to call the API
 
 # Audit logging. With enabled: true but no sink configured, entries live only
@@ -229,7 +313,10 @@ rules:
 | `email` | Generates fake email | `john.doe@example.com` |
 | `phone` | Generates fake phone number | `555-123-4567` |
 | `address` | Generates fake street address | `4821 Maple Ridge` |
-| `name` | Generates fake person name | `Dana Whitfield` |
+| `name` | Generates fake full name | `Dana Whitfield` |
+| `first_name` | Generates fake given name | `Dana` |
+| `last_name` | Generates fake surname | `Whitfield` |
+| `company` | Generates fake company name | `Hartley-Vance Group` |
 | `text` | Generates fake free text | `Lorem ipsum dolor sit.` |
 | `credit_card` | Generates fake CC number | `4532-xxxx-xxxx-1234` |
 | `ssn` | Redacted SSN | `XXX-XX-4821` |
@@ -246,6 +333,19 @@ Masking is deterministic but **keyed**: the same input maps to the same output
 under a given `masking_secret`, and the mapping cannot be reproduced or
 brute-forced without it.
 
+Determinism is what makes the name strategies useful rather than merely safe.
+A constant placeholder tells a reader that a value was masked but destroys the
+ability to tell whether two orders belong to the same customer; a seeded fake
+keeps that inference intact while disclosing nothing. Use `first_name` /
+`last_name` rather than `name` on schemas that split a person across two
+columns — `name` would put a full name in each, which reads as corrupt data
+rather than as a pseudonym.
+
+Set `masking_secret` (or `IRONVEIL_MASKING_SECRET`) in any deployment where
+that reasoning has to survive a restart: without it the key is random per
+process, so the same customer becomes a different fake person after every
+redeploy.
+
 ### Rule Matching Notes
 
 - Identifier matching is case-insensitive on both protocols.
@@ -260,6 +360,67 @@ brute-forced without it.
 - Expressions (`CONCAT`, `SUBSTRING`, `GROUP_CONCAT`, …) have no provenance on
   the wire and are matched by label only. Masking is best-effort by design;
   see the threat model note below.
+
+## Authentication Modes (MySQL)
+
+`auth.mode` decides who holds the database credential.
+
+### `passthrough` (default)
+
+The client's own MySQL credentials cross the proxy untouched. Simple, and
+correct when the client is already trusted with database access — but it means
+whatever process is exposed to the network handles the real database password.
+
+### `terminate`
+
+iron-veil holds the upstream credential itself and authenticates its clients
+against a separately-configured local one:
+
+```
+client --(local throwaway credential)--> iron-veil --(real DB credential)--> MySQL
+```
+
+This restores a process boundary. In the sidecar shape the local credential
+only ever crosses loopback, so it is a throwaway: compromising the exposed
+process yields a credential that is good for nothing but talking to the masking
+proxy, and the database password never leaves iron-veil.
+
+```yaml
+auth:
+  mode: terminate
+  client_username: door
+  client_password_file: /run/secrets/ironveil-client-password
+  upstream_username: support_ro
+  upstream_password_file: /run/secrets/ironveil-upstream-password
+  upstream_database: wms
+```
+
+Notes:
+
+- **The client leg never needs full authentication.** MySQL requires a
+  full-auth round trip for `caching_sha2_password` until it has the credential
+  cached, because `mysql.user` stores a salted SHA256-crypt digest rather than
+  the `SHA256(SHA256(password))` its cache holds. iron-veil is configured with
+  the cleartext password, so it derives that value directly and satisfies fast
+  auth on the first connection — no RSA key pair, and it works with or without
+  client TLS. A client that offers a different plugin is sent a standard
+  `AuthSwitchRequest`.
+- **The upstream leg may.** If the upstream account uses
+  `caching_sha2_password` and the server has not cached the proxy's credential,
+  MySQL demands full authentication, which transmits the password in cleartext.
+  Set `upstream_tls: true` for that path. iron-veil refuses to send the
+  password on an insecure connection and says so rather than failing obscurely.
+  `mysql_native_password` accounts need no full auth and work either way.
+- Supported plugins are `caching_sha2_password` (default, recommended) and
+  `mysql_native_password` on both legs. `client_auth_plugin` sets what is
+  offered to clients; the upstream plugin follows whatever the server asks for.
+- A wrong username and a wrong password produce the same `ER_ACCESS_DENIED`
+  response, so the port is not a username oracle.
+- `terminate` is MySQL-only; the proxy refuses to start if it is set while
+  proxying PostgreSQL.
+- Credentials are resolved once at startup and are **not** re-read on config
+  hot-reload: silently changing who may connect is not something a file watcher
+  should do.
 
 ### Scanner Support
 
@@ -318,13 +479,28 @@ What follows from that:
   over-disclosure is an accepted trade; silently *wrong* data is not, which is
   why the ambiguous heuristics are opt-in.
 - **Nothing pre-masking is retained.** The log ring records the column,
-  strategy, original length and masked preview — never the source value — and
-  SQL string literals are redacted from logged query text.
+  strategy, original length and — only where the whole value was replaced —
+  the generated fake. Partial rewrites (JSON, arrays, embedded spans) report a
+  marker instead, because the untouched remainder of such a value is original
+  result data. SQL string literals are redacted from logged query text, in
+  both dialects: `"..."` is a string literal in MySQL and is scrubbed there,
+  while in PostgreSQL it is an identifier and is kept. Scan-report samples
+  reproduce no characters of the sampled value, only its length.
 - **The control plane fails closed.** The management API can globally disable
   masking, so it binds loopback unless credentials are configured, compares
-  keys in constant time, and uses an explicit CORS allow-list.
+  keys in constant time, and uses an explicit CORS allow-list. It can also be
+  switched off entirely with `api.enabled: false`, which is the right choice
+  wherever nothing consumes it.
+- **The credential boundary is optional but available.** By default the proxy
+  is credential-transparent. `auth.mode: terminate` moves the database
+  credential inside iron-veil and gives clients a separate local one, so the
+  exposed process cannot replay a database password. `tls.require_client_cert`
+  further restricts who may open a session at all.
 - **Unmasked paths are loud.** The MySQL binary protocol is rejected outright;
   PostgreSQL COPY-out is counted and warned about rather than passing silently.
+- **Shutdown is prompt.** SIGTERM stops the accept loop, drains in-flight
+  connections up to `--shutdown-timeout` (default 10s) and exits 0, so
+  rollouts do not stall until the grace period expires.
 
 ## Management API
 
@@ -359,7 +535,7 @@ The management API runs on port 3001 by default.
 ```json
 {
   "status": "ok",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "upstream": {
     "host": "localhost",
     "port": 5432,

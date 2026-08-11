@@ -32,14 +32,69 @@ tls:
   enabled: false
   cert_path: certs/server.crt
   key_path: certs/server.key
+  # Optional mTLS. Setting client_ca_path alone verifies a client certificate
+  # when one is presented but still admits clients without one, which is how
+  # you roll mTLS out without a flag day. Add require_client_cert: true to
+  # make it mandatory.
+  # client_ca_path: certs/client-ca.crt
+  # require_client_cert: false
 upstream_tls: false
+
+# MySQL authentication handling.
+#
+#   passthrough (default) — credential-transparent. The client's own MySQL
+#     credentials cross the proxy untouched, so whatever process is exposed to
+#     clients necessarily handles the real database password.
+#
+#   terminate — the proxy holds the upstream credential itself and
+#     authenticates its clients against a separate local one. In the sidecar
+#     shape the local credential is a throwaway that only ever crosses
+#     loopback, so the exposed door process never sees the real DB password.
+#
+# Every secret can be given inline, read from a file (Kubernetes/Docker secret
+# mounts), or supplied via the environment. Precedence per secret is
+# environment > file > inline.
+#
+# Note: with a caching_sha2_password account upstream, MySQL demands full
+# authentication until it has the credential cached, and full auth sends the
+# password in cleartext — so set upstream_tls: true for that path. The client
+# leg never needs full auth: the proxy holds the cleartext password and can
+# satisfy fast auth on the very first connection.
+# auth:
+#   mode: terminate
+#   client_username: door                    # env: IRONVEIL_CLIENT_USERNAME
+#   client_password: local-throwaway         # env: IRONVEIL_CLIENT_PASSWORD
+#   # client_password_file: /run/secrets/ironveil-client-password
+#   client_auth_plugin: caching_sha2_password  # or mysql_native_password
+#   upstream_username: support_ro            # env: IRONVEIL_UPSTREAM_USERNAME
+#   # upstream_password: ...                 # env: IRONVEIL_UPSTREAM_PASSWORD
+#   upstream_password_file: /run/secrets/ironveil-upstream-password
+#   upstream_database: wms
 telemetry:
   enabled: false
   otlp_endpoint: http://localhost:4317
   service_name: iron-veil
-# Management API: binds 127.0.0.1 unless api.bind is set. Binding a
-# non-loopback address requires api_key or jwt_secret.
-api: null
+
+# Where the proxy's own listener binds. Overridden by --bind/--port and by
+# IRONVEIL_BIND/IRONVEIL_PORT. Default is 0.0.0.0:6543.
+# For a localhost sidecar (the only client shares the network namespace) set
+# bind: 127.0.0.1 so the masked port is never reachable off-host.
+listen:
+  bind: 0.0.0.0
+  port: 6543
+
+# Management API. It is a global masking kill-switch and re-serves the log
+# ring, so it binds 127.0.0.1 unless api.bind says otherwise, and refuses to
+# bind a non-loopback address without api_key or jwt_secret.
+# Recommended for sidecar deployments: enabled: false — nothing consumes
+# /health or /metrics over HTTP there, so the whole control plane can go.
+api:
+  enabled: true
+  bind: 127.0.0.1
+  port: 3001
+  # api_key: change-me
+  # jwt_secret: change-me
+  # cors_origins: [http://localhost:3000]
 limits:
   max_connections: 1000
   upstream_pool_size: 100

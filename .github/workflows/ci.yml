@@ -51,9 +51,15 @@ jobs:
 
       - name: Wait for proxy API readiness
         run: |
+          # The in-container probe distinguishes "API bound loopback-only" from
+          # "API is dead" — but it is a diagnostic, not a verdict. Docker does
+          # not wire the published port up at the instant the container starts,
+          # so the container probe routinely succeeds a beat before the host
+          # one. Failing on that gave the host exactly one attempt, ~200ms
+          # after startup, and aborted the whole job on the first iteration.
+          # Record it instead, and only report it once the retry budget is out.
+          container_ok=false
           for i in {1..60}; do
-            # Prefer host-published port; fall back to in-container curl so a
-            # loopback-only API bind still unblocks diagnostics.
             if curl -fsS http://127.0.0.1:3001/health 2>/dev/null \
                 | jq -e '.upstream.healthy == true' > /dev/null 2>&1; then
               echo "Proxy API is ready and upstream is healthy (host :3001)"
@@ -61,16 +67,17 @@ jobs:
             fi
             if docker compose exec -T proxy curl -fsS http://127.0.0.1:3001/health 2>/dev/null \
                 | jq -e '.upstream.healthy == true' > /dev/null 2>&1; then
-              echo "Proxy API is healthy inside the container, but host :3001 is not reachable."
-              echo "Published management API must bind 0.0.0.0 (see proxy.compose.yaml)."
-              docker compose ps
-              docker compose logs --no-color --tail=50 proxy || true
-              exit 1
+              container_ok=true
             fi
             echo "Waiting for proxy API / healthy upstream... ($i/60)"
             sleep 2
           done
-          echo "Proxy API did not report a healthy upstream in time"
+          if [ "$container_ok" = true ]; then
+            echo "Proxy API is healthy inside the container, but host :3001 never became reachable."
+            echo "Published management API must bind 0.0.0.0 (see proxy.compose.yaml)."
+          else
+            echo "Proxy API did not report a healthy upstream in time"
+          fi
           docker compose ps
           docker compose logs --no-color proxy postgres || true
           exit 1

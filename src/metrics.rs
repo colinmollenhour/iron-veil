@@ -82,6 +82,17 @@ pub fn record_binary_protocol_rejected() {
     counter!("ironveil_binary_protocol_rejected_total").increment(1);
 }
 
+/// Record the outcome of a client authentication attempt against the proxy's
+/// own credential (`auth.mode: terminate`). A rising failure count on a
+/// loopback-only sidecar means something local is probing the port.
+pub fn record_client_auth(success: bool) {
+    counter!(
+        "ironveil_client_auth_total",
+        "outcome" => if success { "success" } else { "failure" }
+    )
+    .increment(1);
+}
+
 /// Record PostgreSQL COPY data forwarded without masking (unmasked path).
 pub fn record_copy_passthrough() {
     counter!("ironveil_copy_passthrough_total").increment(1);
