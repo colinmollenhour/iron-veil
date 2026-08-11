@@ -146,10 +146,11 @@ fn spawn_shutdown_watcher() -> CancellationToken {
 async fn drain_connections(active: &std::sync::atomic::AtomicUsize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while active.load(Ordering::Relaxed) > 0 {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(25).min(deadline - Instant::now())).await;
+        tokio::time::sleep(Duration::from_millis(25).min(remaining)).await;
     }
     true
 }
@@ -1698,13 +1699,15 @@ fn negotiate_upstream_capabilities(
 
     let mut caps = client_caps & server_caps;
     caps &= !(CLIENT_SSL | CLIENT_COMPRESS | CLIENT_CONNECT_WITH_DB | CLIENT_CONNECT_ATTRS);
-    caps |= CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+
+    let mut proxy_caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
     if with_database {
-        caps |= CLIENT_CONNECT_WITH_DB;
+        proxy_caps |= CLIENT_CONNECT_WITH_DB;
     }
     if tls {
-        caps |= CLIENT_SSL;
+        proxy_caps |= CLIENT_SSL;
     }
+    caps |= proxy_caps & server_caps;
     caps
 }
 
@@ -2827,11 +2830,22 @@ mod tests {
 
     #[test]
     fn test_upstream_capabilities_never_exceed_what_the_server_offers() {
-        use crate::protocol::mysql::CLIENT_DEPRECATE_EOF;
+        use crate::protocol::mysql::{
+            CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41,
+            CLIENT_SECURE_CONNECTION, CLIENT_SSL,
+        };
 
-        // Client wants DEPRECATE_EOF, server does not support it.
-        let caps = negotiate_upstream_capabilities(u32::MAX, !CLIENT_DEPRECATE_EOF, false, false);
-        assert_eq!(caps & CLIENT_DEPRECATE_EOF, 0);
+        // The server withholds both a client-owned shape bit and every bit the
+        // proxy would otherwise add for its own handshake response.
+        let server = u32::MAX
+            & !(CLIENT_DEPRECATE_EOF
+                | CLIENT_PROTOCOL_41
+                | CLIENT_SECURE_CONNECTION
+                | CLIENT_PLUGIN_AUTH
+                | CLIENT_CONNECT_WITH_DB
+                | CLIENT_SSL);
+        let caps = negotiate_upstream_capabilities(u32::MAX, server, true, true);
+        assert_eq!(caps & !server, 0);
     }
 
     #[test]

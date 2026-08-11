@@ -477,26 +477,28 @@ impl MySqlCodec {
                 }
             }
             MySqlState::WaitingAuthResponse => {
-                // OK ends the exchange; ERR ends the connection. Everything
-                // else — AuthSwitchRequest, AuthMoreData, the client's raw
-                // scramble or cleartext password — is opaque here and is
-                // handed to the auth loop untouched.
-                match packet.first().copied() {
-                    Some(0x00) => {
-                        if let Ok(ok) = parse_ok_packet(&packet, sequence_id, self.capability_flags)
-                        {
-                            self.state = MySqlState::Command;
-                            return Ok(Some(MySqlMessage::Ok(ok)));
+                // Only the upstream-facing codec receives server OK/ERR packets.
+                // Client auth replies are opaque scrambles or passwords whose
+                // first byte can legitimately be 0x00 or 0xff.
+                if self.is_client_side {
+                    match packet.first().copied() {
+                        Some(0x00) => {
+                            if let Ok(ok) =
+                                parse_ok_packet(&packet, sequence_id, self.capability_flags)
+                            {
+                                self.state = MySqlState::Command;
+                                return Ok(Some(MySqlMessage::Ok(ok)));
+                            }
                         }
-                    }
-                    Some(0xff) => {
-                        if let Ok(err) =
-                            parse_err_packet(&packet, sequence_id, self.capability_flags)
-                        {
-                            return Ok(Some(MySqlMessage::Err(err)));
+                        Some(0xff) => {
+                            if let Ok(err) =
+                                parse_err_packet(&packet, sequence_id, self.capability_flags)
+                            {
+                                return Ok(Some(MySqlMessage::Err(err)));
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
                 Ok(Some(MySqlMessage::Generic(GenericPacket {
                     sequence_id,
@@ -1514,6 +1516,24 @@ mod tests {
         out_codec.set_capability_flags(CLIENT_PROTOCOL_41);
         let encoded = encode_one(&mut out_codec, MySqlMessage::Ok(ok));
         assert_eq!(encoded, bytes, "OK packet must round-trip verbatim");
+    }
+
+    #[test]
+    fn test_client_auth_replies_starting_with_ok_or_err_bytes_stay_opaque() {
+        for leading_byte in [0x00, 0xff] {
+            let mut payload = [0u8; 20];
+            payload[0] = leading_byte;
+            let bytes = packet(&payload, 2);
+
+            let mut codec = MySqlCodec::new_server();
+            codec.set_capability_flags(CLIENT_PROTOCOL_41);
+            codec.set_auth_response_state();
+
+            let MySqlMessage::Generic(reply) = decode_one(&mut codec, &bytes) else {
+                panic!("client auth reply starting with {leading_byte:#04x} was parsed");
+            };
+            assert_eq!(&reply.payload[..], payload);
+        }
     }
 
     #[test]
