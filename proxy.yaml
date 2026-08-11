@@ -37,9 +37,27 @@ telemetry:
   enabled: false
   otlp_endpoint: http://localhost:4317
   service_name: iron-veil
-# Management API: binds 127.0.0.1 unless api.bind is set. Binding a
-# non-loopback address requires api_key or jwt_secret.
-api: null
+
+# Where the proxy's own listener binds. Overridden by --bind/--port and by
+# IRONVEIL_BIND/IRONVEIL_PORT. Default is 0.0.0.0:6543.
+# For a localhost sidecar (the only client shares the network namespace) set
+# bind: 127.0.0.1 so the masked port is never reachable off-host.
+listen:
+  bind: 0.0.0.0
+  port: 6543
+
+# Management API. It is a global masking kill-switch and re-serves the log
+# ring, so it binds 127.0.0.1 unless api.bind says otherwise, and refuses to
+# bind a non-loopback address without api_key or jwt_secret.
+# Recommended for sidecar deployments: enabled: false — nothing consumes
+# /health or /metrics over HTTP there, so the whole control plane can go.
+api:
+  enabled: true
+  bind: 127.0.0.1
+  port: 3001
+  # api_key: change-me
+  # jwt_secret: change-me
+  # cors_origins: [http://localhost:3000]
 limits:
   max_connections: 1000
   upstream_pool_size: 100

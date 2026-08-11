@@ -41,9 +41,9 @@ pub enum DbProtocol {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value_t = 6543)]
-    port: u16,
+    /// Port to listen on [env: IRONVEIL_PORT, config: listen.port, default: 6543]
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Upstream database host
     #[arg(long, default_value = "127.0.0.1")]
@@ -57,19 +57,28 @@ struct Args {
     #[arg(long, default_value = "proxy.yaml")]
     config: String,
 
-    /// Address the proxy listener binds to
-    #[arg(long, default_value = "0.0.0.0")]
-    bind: std::net::IpAddr,
+    /// Address the proxy listener binds to. Use 127.0.0.1 for the
+    /// localhost-sidecar deployment.
+    /// [env: IRONVEIL_BIND, config: listen.bind, default: 0.0.0.0]
+    #[arg(long)]
+    bind: Option<std::net::IpAddr>,
 
     /// Management API port
-    #[arg(long, default_value_t = 3001)]
-    api_port: u16,
+    /// [env: IRONVEIL_API_PORT, config: api.port, default: 3001]
+    #[arg(long)]
+    api_port: Option<u16>,
 
-    /// Address the management API binds to (overrides api.bind from the
-    /// config file; defaults to 127.0.0.1). Binding a non-loopback address
+    /// Address the management API binds to. Binding a non-loopback address
     /// requires api.api_key or api.jwt_secret.
+    /// [env: IRONVEIL_API_BIND, config: api.bind, default: 127.0.0.1]
     #[arg(long)]
     api_bind: Option<std::net::IpAddr>,
+
+    /// Do not start the management API at all. The proxy then serves no HTTP
+    /// control plane, /health or /metrics.
+    /// [env: IRONVEIL_API_ENABLED, config: api.enabled]
+    #[arg(long, conflicts_with_all = ["api_bind", "api_port"])]
+    no_api: bool,
 
     /// Database protocol to proxy
     #[arg(long, value_enum, default_value_t = DbProtocol::Postgres)]
@@ -79,6 +88,12 @@ struct Args {
     /// in-flight connections to drain before aborting them and exiting.
     #[arg(long, default_value_t = 10)]
     shutdown_timeout: u64,
+}
+
+/// Read an environment variable, treating "set but empty" as unset so an
+/// exported-but-blank var in a compose file cannot shadow the config file.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// Waits for a shutdown signal (SIGTERM, SIGINT, or Ctrl+C).
@@ -566,26 +581,61 @@ async fn main() -> Result<()> {
     )
     .with_metrics(metrics_handle);
 
+    // Resolve where both listeners bind: CLI > env > config file > default.
+    let listen_cfg = config.listen.as_ref();
+    let proxy_bind = config::resolve_listen_addr(
+        args.bind,
+        env_var("IRONVEIL_BIND").as_deref(),
+        listen_cfg.and_then(|l| l.bind.as_deref()),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        "proxy listener",
+    )?;
+    let proxy_port = config::resolve_listen_port(
+        args.port,
+        env_var("IRONVEIL_PORT").as_deref(),
+        listen_cfg.and_then(|l| l.port),
+        6543,
+        "proxy listener",
+    )?;
+
+    let api_cfg = config.api.as_ref();
+    let api_enabled = config::resolve_flag(
+        // --no-api is a one-way switch: its absence is not a request to enable.
+        if args.no_api { Some(false) } else { None },
+        env_var("IRONVEIL_API_ENABLED").as_deref(),
+        api_cfg.map(|a| a.enabled),
+        true,
+        "api.enabled",
+    )?;
+    let api_bind = config::resolve_listen_addr(
+        args.api_bind,
+        env_var("IRONVEIL_API_BIND").as_deref(),
+        api_cfg.and_then(|a| a.bind.as_deref()),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        "management API",
+    )?;
+    let api_port = config::resolve_listen_port(
+        args.api_port,
+        env_var("IRONVEIL_API_PORT").as_deref(),
+        api_cfg.and_then(|a| a.port),
+        3001,
+        "management API",
+    )?;
+
     // Start Management API in a separate task
-    let api_port = args.api_port;
-    let api_bind = match args.api_bind {
-        Some(addr) => addr,
-        None => match config.api.as_ref().and_then(|a| a.bind.as_deref()) {
-            Some(bind) => bind
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid api.bind '{}': {}", bind, e))?,
-            None => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        },
-    };
-    let api_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = api::start_api_server(api_bind, api_port, api_state).await {
-            // The API carries /health, /metrics and the masking control
-            // plane; running blind without it is worse than restarting.
-            tracing::error!("management API server failed: {}", e);
-            std::process::exit(1);
-        }
-    });
+    if api_enabled {
+        let api_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = api::start_api_server(api_bind, api_port, api_state).await {
+                // The API carries /health, /metrics and the masking control
+                // plane; running blind without it is worse than restarting.
+                tracing::error!("management API server failed: {}", e);
+                std::process::exit(1);
+            }
+        });
+    } else {
+        info!("Management API disabled; no HTTP control plane, /health or /metrics will be served");
+    }
 
     // Start upstream health check task
     let health_check_enabled = config
@@ -621,7 +671,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Starting DB Proxy on {}:{}", args.bind, args.port);
+    info!("Starting DB Proxy on {}:{}", proxy_bind, proxy_port);
     info!(
         "Forwarding to upstream at {}:{}",
         args.upstream_host, args.upstream_port
@@ -646,7 +696,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let listener = tokio::net::TcpListener::bind((args.bind, args.port)).await?;
+    let listener = tokio::net::TcpListener::bind((proxy_bind, proxy_port)).await?;
     let protocol = args.protocol;
 
     // Create cancellation token for graceful shutdown

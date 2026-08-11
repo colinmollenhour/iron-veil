@@ -1036,8 +1036,7 @@ mod tests {
             api: Some(ApiConfig {
                 api_key: Some("my-secret-key".to_string()),
                 jwt_secret: None,
-                bind: None,
-                cors_origins: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1139,8 +1138,7 @@ mod tests {
             api: Some(ApiConfig {
                 api_key: None,
                 jwt_secret: Some("my-jwt-secret".to_string()),
-                bind: None,
-                cors_origins: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1649,8 +1647,7 @@ mod tests {
         let state = auth_test_state(Some(ApiConfig {
             api_key: Some("secret".to_string()),
             jwt_secret: None,
-            bind: None,
-            cors_origins: None,
+            ..Default::default()
         }));
         assert_eq!(
             auth_request(state, vec![]).await,
@@ -1664,8 +1661,7 @@ mod tests {
         let state = auth_test_state(Some(ApiConfig {
             api_key: Some("secret".to_string()),
             jwt_secret: None,
-            bind: None,
-            cors_origins: None,
+            ..Default::default()
         }));
         assert_eq!(
             auth_request(state, vec![("X-API-Key", "wrong".to_string())]).await,
@@ -1678,8 +1674,7 @@ mod tests {
         let state = auth_test_state(Some(ApiConfig {
             api_key: Some("secret".to_string()),
             jwt_secret: None,
-            bind: None,
-            cors_origins: None,
+            ..Default::default()
         }));
         assert_eq!(
             auth_request(state, vec![("X-API-Key", "secret".to_string())]).await,
@@ -1692,8 +1687,7 @@ mod tests {
         let state = auth_test_state(Some(ApiConfig {
             api_key: Some("secret".to_string()),
             jwt_secret: None,
-            bind: None,
-            cors_origins: None,
+            ..Default::default()
         }));
         assert_eq!(
             auth_request(
@@ -1710,8 +1704,7 @@ mod tests {
         let state = auth_test_state(Some(ApiConfig {
             api_key: None,
             jwt_secret: Some("jwt-secret".to_string()),
-            bind: None,
-            cors_origins: None,
+            ..Default::default()
         }));
 
         let valid = jwt_for("jwt-secret", 3600);

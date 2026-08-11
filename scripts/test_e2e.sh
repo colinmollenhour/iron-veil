@@ -341,6 +341,89 @@ test_graceful_shutdown() {
 }
 
 #######################################
+# Listener Configuration Tests
+#######################################
+
+# The sidecar posture depends on both listeners being pinnable to loopback and
+# on the management API being removable outright. Assert the wire behaviour,
+# not just that the flags parse.
+test_listener_configuration() {
+    log_section "Test: Listen Address / Management API Toggles"
+
+    # 1. --no-api must leave nothing listening on the API port at all.
+    ./target/release/iron-veil \
+        --config "$E2E_CONFIG" \
+        --port "$GRACEFUL_TEST_PORT" \
+        --upstream-host localhost \
+        --upstream-port "$PG_PORT" \
+        --protocol postgres \
+        --no-api &
+    local pid=$!
+    sleep 2
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log_error "--no-api: proxy failed to start"
+    else
+        if tcp_port_open localhost "$API_PORT"; then
+            log_error "--no-api: management API is still listening on $API_PORT"
+        else
+            log_success "--no-api: no management API listener"
+        fi
+        if tcp_port_open localhost "$GRACEFUL_TEST_PORT"; then
+            log_success "--no-api: proxy listener still serving"
+        else
+            log_error "--no-api: proxy listener is not serving"
+        fi
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    # 2. IRONVEIL_BIND / IRONVEIL_PORT must be honoured with no CLI flags.
+    IRONVEIL_BIND=127.0.0.1 IRONVEIL_PORT="$GRACEFUL_TEST_PORT" \
+    IRONVEIL_API_ENABLED=false \
+        ./target/release/iron-veil \
+            --config "$E2E_CONFIG" \
+            --upstream-host localhost \
+            --upstream-port "$PG_PORT" \
+            --protocol postgres &
+    pid=$!
+    sleep 2
+
+    if tcp_port_open localhost "$GRACEFUL_TEST_PORT"; then
+        log_success "IRONVEIL_BIND/IRONVEIL_PORT honoured without CLI flags"
+    else
+        log_error "IRONVEIL_BIND/IRONVEIL_PORT were not honoured"
+    fi
+    if tcp_port_open localhost "$API_PORT"; then
+        log_error "IRONVEIL_API_ENABLED=false: management API is still listening"
+    else
+        log_success "IRONVEIL_API_ENABLED=false disables the management API"
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+
+    # 3. An explicit CLI flag must beat the environment.
+    IRONVEIL_PORT=1 \
+        ./target/release/iron-veil \
+            --config "$E2E_CONFIG" \
+            --port "$GRACEFUL_TEST_PORT" \
+            --upstream-host localhost \
+            --upstream-port "$PG_PORT" \
+            --api-port "$GRACEFUL_API_PORT" \
+            --protocol postgres &
+    pid=$!
+    sleep 2
+
+    if tcp_port_open localhost "$GRACEFUL_TEST_PORT"; then
+        log_success "--port overrides IRONVEIL_PORT"
+    else
+        log_error "--port did not override IRONVEIL_PORT"
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+#######################################
 # Port Conflict Check
 #######################################
 
@@ -943,6 +1026,7 @@ main() {
             run_negative_tests
             run_connection_tests
             run_upstream_failure_tests
+            test_listener_configuration
             test_graceful_shutdown
             ;;
         mysql)
@@ -955,6 +1039,7 @@ main() {
             run_negative_tests
             run_connection_tests
             run_upstream_failure_tests
+            test_listener_configuration
             test_graceful_shutdown
             ;;
         *)
