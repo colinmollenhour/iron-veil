@@ -75,34 +75,68 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DbProtocol::Postgres)]
     protocol: DbProtocol,
 
-    /// Graceful shutdown timeout in seconds
-    #[arg(long, default_value_t = 30)]
+    /// Graceful shutdown timeout in seconds: how long SIGTERM waits for
+    /// in-flight connections to drain before aborting them and exiting.
+    #[arg(long, default_value_t = 10)]
     shutdown_timeout: u64,
 }
 
-/// Waits for a shutdown signal (SIGTERM, SIGINT, or Ctrl+C)
+/// Waits for a shutdown signal (SIGTERM, SIGINT, or Ctrl+C).
+///
+/// The signal receivers are created *inside* this future, so it must be polled
+/// to completion by a dedicated task — see `spawn_shutdown_watcher`. Selecting
+/// on a freshly-built `shutdown_signal()` on every accept-loop iteration drops
+/// the receivers each time a connection arrives, and a SIGTERM delivered in
+/// that window is lost: tokio's process-wide handler records it against a
+/// registration that no longer exists. That is why `docker stop` on a busy
+/// proxy hit the grace period and needed SIGKILL.
 async fn shutdown_signal() {
-    let ctrl_c = async {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler");
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("Failed to install SIGINT handler");
+        tokio::select! {
+            _ = terminate.recv() => info!("Received SIGTERM, initiating shutdown..."),
+            _ = interrupt.recv() => info!("Received SIGINT, initiating shutdown..."),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => info!("Received Ctrl+C, initiating shutdown..."),
-        _ = terminate => info!("Received SIGTERM, initiating shutdown..."),
+        info!("Received Ctrl+C, initiating shutdown...");
     }
+}
+
+/// Install the signal handlers once, up front, and surface them as a token.
+/// Returns immediately; the returned token is cancelled when a signal lands.
+fn spawn_shutdown_watcher() -> CancellationToken {
+    let token = CancellationToken::new();
+    let signalled = token.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        signalled.cancel();
+    });
+    token
+}
+
+/// Wait for in-flight connections to finish, up to `timeout`. Returns true when
+/// the count reached zero in time, false when the deadline forced an abort.
+async fn drain_connections(active: &std::sync::atomic::AtomicUsize, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while active.load(Ordering::Relaxed) > 0 {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25).min(deadline - Instant::now())).await;
+    }
+    true
 }
 
 /// Background task that periodically checks upstream database connectivity
@@ -619,6 +653,10 @@ async fn main() -> Result<()> {
     let cancel_token = CancellationToken::new();
     let shutdown_timeout = args.shutdown_timeout;
 
+    // Install signal handlers before the first accept: a SIGTERM that arrives
+    // while the loop is busy servicing an accept must still be observed.
+    let shutdown = spawn_shutdown_watcher();
+
     // Connection limiting
     let max_connections = config.limits.as_ref().and_then(|l| l.max_connections);
     let connection_semaphore = max_connections.map(|max| {
@@ -823,14 +861,14 @@ async fn main() -> Result<()> {
             }
 
             // Wait for shutdown signal
-            _ = shutdown_signal() => {
+            _ = shutdown.cancelled() => {
                 info!("Shutdown signal received, stopping accept loop...");
                 break;
             }
         }
     }
 
-    // Graceful shutdown: wait for active connections to drain
+    // Graceful shutdown: stop accepting, then let in-flight connections close.
     info!(
         "Waiting for {} active connections to close (timeout: {}s)...",
         state.active_connections.load(Ordering::Relaxed),
@@ -840,19 +878,16 @@ async fn main() -> Result<()> {
     // Signal all connections to shutdown
     cancel_token.cancel();
 
-    // Wait for connections to drain with timeout
-    let drain_start = std::time::Instant::now();
-    let timeout_duration = std::time::Duration::from_secs(shutdown_timeout);
-
-    while state.active_connections.load(Ordering::Relaxed) > 0 {
-        if drain_start.elapsed() >= timeout_duration {
-            warn!(
-                "Shutdown timeout reached, {} connections still active",
-                state.active_connections.load(Ordering::Relaxed)
-            );
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    if !drain_connections(
+        &state.active_connections,
+        Duration::from_secs(shutdown_timeout),
+    )
+    .await
+    {
+        warn!(
+            "Shutdown timeout reached, aborting {} connections still active",
+            state.active_connections.load(Ordering::Relaxed)
+        );
     }
 
     info!("Shutdown complete.");
@@ -867,6 +902,29 @@ async fn main() -> Result<()> {
 /// handshake): unauthenticated peers must not be able to pin a task and an fd
 /// by connecting and sending nothing.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Await one step of the authentication exchange under the handshake deadline,
+/// bailing out early when the proxy is shutting down.
+///
+/// Without the cancel arm a connection still negotiating auth ignores SIGTERM
+/// for up to `HANDSHAKE_DEADLINE`, which is longer than the default shutdown
+/// timeout — so a rollout that catches a connecting client always ends in a
+/// forced abort instead of a clean drain.
+async fn auth_step<T>(
+    cancel: &CancellationToken,
+    what: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            Err(anyhow::anyhow!("proxy is shutting down while waiting for {what}"))
+        }
+        result = tokio::time::timeout(HANDSHAKE_DEADLINE, fut) => {
+            result.map_err(|_| anyhow::anyhow!("{what} timed out"))
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn process_postgres_connection(
@@ -1496,9 +1554,12 @@ async fn handle_mysql_protocol(
         .set_capability_flags(handshake.capability_flags);
 
     // Phase 2: client handshake response, upgrading to TLS if the client asks
-    let mut client_response = match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
-        .await
-        .map_err(|_| anyhow::anyhow!("client handshake response timed out"))?
+    let mut client_response = match auth_step(
+        &cancel,
+        "the client handshake response",
+        client_framed.next(),
+    )
+    .await?
     {
         Some(Ok(MySqlMessage::HandshakeResponse(r))) => r,
         Some(Ok(other)) => {
@@ -1521,9 +1582,12 @@ async fn handle_mysql_protocol(
         // buffered past the SSLRequest packet.
         let parts = client_framed.into_parts();
         let prefixed = PrefixedStream::new(parts.read_buf, parts.io);
-        let tls_stream = tokio::time::timeout(HANDSHAKE_DEADLINE, acceptor.accept(prefixed))
-            .await
-            .map_err(|_| anyhow::anyhow!("client TLS handshake timed out"))??;
+        let tls_stream = auth_step(
+            &cancel,
+            "the client TLS handshake",
+            acceptor.accept(prefixed),
+        )
+        .await??;
         info!("MySQL client connection upgraded to TLS");
 
         client_framed = Framed::new(
@@ -1531,9 +1595,12 @@ async fn handle_mysql_protocol(
             MySqlCodec::new_server_awaiting_handshake_response(negotiated_caps),
         );
 
-        client_response = match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
-            .await
-            .map_err(|_| anyhow::anyhow!("client handshake response timed out after TLS"))?
+        client_response = match auth_step(
+            &cancel,
+            "the client handshake response after TLS",
+            client_framed.next(),
+        )
+        .await?
         {
             Some(Ok(MySqlMessage::HandshakeResponse(r))) => r,
             Some(Ok(other)) => {
@@ -1612,9 +1679,12 @@ async fn handle_mysql_protocol(
             anyhow::bail!("MySQL authentication exceeded 20 round trips");
         }
 
-        match tokio::time::timeout(HANDSHAKE_DEADLINE, upstream_framed.next())
-            .await
-            .map_err(|_| anyhow::anyhow!("upstream auth response timed out"))?
+        match auth_step(
+            &cancel,
+            "the upstream auth response",
+            upstream_framed.next(),
+        )
+        .await?
         {
             Some(Ok(msg @ MySqlMessage::Ok(_))) => {
                 info!("MySQL authentication successful");
@@ -1643,9 +1713,8 @@ async fn handle_mysql_protocol(
                 };
                 client_framed.send(other).await?;
                 if expects_reply {
-                    match tokio::time::timeout(HANDSHAKE_DEADLINE, client_framed.next())
-                        .await
-                        .map_err(|_| anyhow::anyhow!("client auth response timed out"))?
+                    match auth_step(&cancel, "the client auth response", client_framed.next())
+                        .await?
                     {
                         Some(Ok(reply)) => upstream_framed.send(reply).await?,
                         Some(Err(e)) => return Err(e),
@@ -1805,11 +1874,14 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamPoolAcquireError, UpstreamSlotManager, build_mysql_err_packet,
-        build_postgres_fatal_error_packet, resolve_timeout_limits,
+        UpstreamPoolAcquireError, UpstreamSlotManager, auth_step, build_mysql_err_packet,
+        build_postgres_fatal_error_packet, drain_connections, resolve_timeout_limits,
     };
     use crate::config::LimitsConfig;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_build_postgres_fatal_error_packet_format() {
@@ -1886,6 +1958,66 @@ mod tests {
 
         drop(lease);
         assert_eq!(manager.available_slots(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_drain_returns_immediately_when_no_connections() {
+        let active = AtomicUsize::new(0);
+        assert!(drain_connections(&active, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_waits_for_connections_to_close() {
+        let active = Arc::new(AtomicUsize::new(2));
+        let closer = active.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            closer.store(0, Ordering::Relaxed);
+        });
+
+        assert!(
+            drain_connections(&active, Duration::from_secs(5)).await,
+            "drain should report success once the count reaches zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_gives_up_at_the_deadline() {
+        // A connection that never closes must not hold the process past the
+        // shutdown timeout — that is exactly the k8s rollout stall in B-5.
+        let active = AtomicUsize::new(1);
+        let started = std::time::Instant::now();
+
+        assert!(!drain_connections(&active, Duration::from_millis(50)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "drain must abort promptly at the deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_step_aborts_when_shutting_down() {
+        // An in-auth connection blocked on a peer that never answers must
+        // observe cancellation rather than sit out the full handshake deadline.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = auth_step(&cancel, "a reply", std::future::pending::<()>()).await;
+        let err = result.expect_err("cancelled auth step should fail");
+        assert!(
+            err.to_string().contains("shutting down"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_step_passes_through_the_value() {
+        let cancel = CancellationToken::new();
+        let value = auth_step(&cancel, "a reply", async { 42u8 })
+            .await
+            .expect("uncancelled auth step should succeed");
+        assert_eq!(value, 42);
     }
 
     #[tokio::test]
