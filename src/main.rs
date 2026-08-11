@@ -288,32 +288,42 @@ impl Drop for UpstreamSlotLease {
     }
 }
 
-/// Replace SQL string-literal contents with '?' before logging: query text in
+/// Replace SQL string-literal contents with `?` before logging: query text in
 /// INSERT/WHERE clauses routinely carries the exact PII this proxy exists to
 /// suppress, and the log ring is re-served by GET /logs.
-fn redact_sql_literals(sql: &str) -> String {
+///
+/// `double_quoted_is_string` must be true for MySQL, where `"..."` is a string
+/// literal unless ANSI_QUOTES is set — so `WHERE email = "a@b.com"` wrote the
+/// address straight into the ring. It must be false for PostgreSQL, where
+/// `"..."` is a quoted identifier and redacting it would erase the table and
+/// column names that make the log useful without suppressing anything.
+///
+/// Redaction is deliberately greedy: an unterminated or oddly-escaped literal
+/// swallows the rest of the statement rather than resuming in cleartext.
+fn redact_sql_literals(sql: &str, double_quoted_is_string: bool) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\'' {
-            out.push_str("'?'");
+        if c == '\'' || (double_quoted_is_string && c == '"') {
+            let quote = c;
+            out.push(quote);
+            out.push('?');
+            out.push(quote);
             let mut escaped = false;
             while let Some(n) = chars.next() {
                 if escaped {
                     escaped = false;
                     continue;
                 }
-                match n {
-                    '\\' => escaped = true,
-                    '\'' => {
-                        // '' is an escaped quote inside the literal
-                        if chars.peek() == Some(&'\'') {
-                            chars.next();
-                        } else {
-                            break;
-                        }
+                if n == '\\' {
+                    escaped = true;
+                } else if n == quote {
+                    // A doubled quote is an escaped quote inside the literal.
+                    if chars.peek() == Some(&quote) {
+                        chars.next();
+                    } else {
+                        break;
                     }
-                    _ => {}
                 }
             }
         } else {
@@ -1239,7 +1249,7 @@ where
                                     timestamp: Utc::now(),
                                     connection_id,
                                     event_type: "Query".to_string(),
-                                    content: redact_sql_literals(&query_str),
+                                    content: redact_sql_literals(&query_str, false),
                                     details: None,
                                 }).await;
 
@@ -1266,7 +1276,7 @@ where
                                     timestamp: Utc::now(),
                                     connection_id,
                                     event_type: "Parse".to_string(),
-                                    content: redact_sql_literals(&query_str),
+                                    content: redact_sql_literals(&query_str, false),
                                     details: None,
                                 }).await;
 
@@ -1797,7 +1807,7 @@ async fn handle_mysql_protocol(
                                     timestamp: Utc::now(),
                                     connection_id,
                                     event_type: "MySqlQuery".to_string(),
-                                    content: redact_sql_literals(&query_str),
+                                    content: redact_sql_literals(&query_str, true),
                                     details: None,
                                 }).await;
 
@@ -1925,7 +1935,8 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
 mod tests {
     use super::{
         UpstreamPoolAcquireError, UpstreamSlotManager, auth_step, build_mysql_err_packet,
-        build_postgres_fatal_error_packet, drain_connections, resolve_timeout_limits,
+        build_postgres_fatal_error_packet, drain_connections, redact_sql_literals,
+        resolve_timeout_limits,
     };
     use crate::config::LimitsConfig;
     use std::sync::Arc;
@@ -2008,6 +2019,51 @@ mod tests {
 
         drop(lease);
         assert_eq!(manager.available_slots(), 1);
+    }
+
+    #[test]
+    fn test_redact_sql_literals_scrubs_single_quoted_strings() {
+        let redacted = redact_sql_literals(
+            "SELECT * FROM users WHERE email = 'alice@example.com' AND city = 'Vienna'",
+            false,
+        );
+        assert!(!redacted.contains("alice@example.com"), "got: {redacted}");
+        assert!(!redacted.contains("Vienna"), "got: {redacted}");
+        // The shape of the statement survives — that is the audit value.
+        assert!(redacted.starts_with("SELECT * FROM users WHERE email = '?'"));
+    }
+
+    #[test]
+    fn test_redact_sql_literals_scrubs_mysql_double_quoted_strings() {
+        // In MySQL (without ANSI_QUOTES) "..." is a string literal, so this
+        // used to write the address straight into the log ring.
+        let sql = r#"SELECT * FROM users WHERE email = "alice@example.com""#;
+        assert!(!redact_sql_literals(sql, true).contains("alice@example.com"));
+    }
+
+    #[test]
+    fn test_redact_sql_literals_keeps_postgres_quoted_identifiers() {
+        // In PostgreSQL "..." is an identifier; redacting it would erase the
+        // table and column names without suppressing anything.
+        let redacted = redact_sql_literals(r#"SELECT "Email" FROM "Users""#, false);
+        assert_eq!(redacted, r#"SELECT "Email" FROM "Users""#);
+    }
+
+    #[test]
+    fn test_redact_sql_literals_handles_escapes() {
+        // Doubled quote inside a literal must not end it early.
+        let redacted = redact_sql_literals("SELECT 'O''Brien secret' , 1", false);
+        assert!(!redacted.contains("Brien"), "got: {redacted}");
+        assert!(redacted.contains(", 1"), "got: {redacted}");
+
+        // Backslash-escaped quote likewise.
+        let redacted = redact_sql_literals(r"SELECT 'a\'b secret' , 2", false);
+        assert!(!redacted.contains("secret"), "got: {redacted}");
+
+        // An unterminated literal swallows the tail rather than resuming in
+        // cleartext.
+        let redacted = redact_sql_literals("SELECT 'dangling alice@example.com", false);
+        assert!(!redacted.contains("alice@example.com"), "got: {redacted}");
     }
 
     #[tokio::test]

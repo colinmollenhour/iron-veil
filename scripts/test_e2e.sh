@@ -665,6 +665,37 @@ run_mysql_tests() {
     assert_masked 1 "buyer@shop.com" "MySQL Heuristic: Email detected and masked"
     assert_masked 1 "4111-1111-1111-1111" "MySQL Heuristic: Credit card detected and masked"
 
+    # Test 3: the audit path must not re-serve what the proxy just masked.
+    # A masking proxy whose GET /logs hands back the cleartext defeats itself
+    # (audit B2), so assert it on the wire after real masked queries.
+    log_section "Test: Audit Path Carries No Pre-Masking Data"
+    run_query_mysql "SELECT email FROM users WHERE email = 'mysql.user@test.com';"
+    local logs
+    logs=$(curl -s "http://localhost:$API_PORT/logs" || true)
+
+    if [ -z "$logs" ]; then
+        log_error "Audit path: could not read GET /logs"
+    else
+        local leaked=false
+        for pii in "mysql.user@test.com" "555-111-2222" "buyer@shop.com" \
+                   "4111-1111-1111-1111" "1600 Pennsylvania Avenue"; do
+            if printf '%s' "$logs" | grep -qF "$pii"; then
+                log_error "Audit path: GET /logs leaked pre-masking value '$pii'"
+                leaked=true
+            fi
+        done
+        if [ "$leaked" = false ]; then
+            log_success "Audit path: GET /logs contains no pre-masking values"
+        fi
+
+        # ...and it is not empty-by-accident: the metadata must be there.
+        if printf '%s' "$logs" | grep -q "original_len"; then
+            log_success "Audit path: masking metadata still recorded"
+        else
+            log_error "Audit path: no masking metadata recorded (test proves nothing)"
+        fi
+    fi
+
     # Stop proxy
     kill "$PROXY_PID" 2>/dev/null || true
     PROXY_PID=""

@@ -621,27 +621,16 @@ impl DbScanner {
         (match_count, detected_type, sample_value)
     }
 
-    /// Mask a sample value for display (don't expose full PII).
-    /// Operates on characters — byte slicing panicked on multi-byte values.
+    /// Describe a sampled value for display without reproducing any of it.
+    ///
+    /// This previously kept the leading and trailing three characters
+    /// (`alice@example.com` -> `ali***com`). Those are raw source characters,
+    /// and the scan report is re-served over the management API — for a card
+    /// number or an email domain, a six-character window is a meaningful
+    /// disclosure. Scan results exist to answer "is there PII in this column",
+    /// which the type and the length already answer.
     fn mask_sample(&self, value: &str) -> String {
-        let len = value.chars().count();
-        let edge = if len <= 4 {
-            return "*".repeat(len);
-        } else if len <= 8 {
-            2
-        } else {
-            3
-        };
-        let head: String = value.chars().take(edge).collect();
-        let tail: String = value
-            .chars()
-            .rev()
-            .take(edge)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        format!("{}***{}", head, tail)
+        format!("*** ({} chars)", value.chars().count())
     }
 }
 
@@ -716,13 +705,37 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_sample() {
+    fn test_mask_sample_reproduces_no_source_characters() {
         let scanner = DbScanner::new("localhost".to_string(), 5432, DbProtocol::Postgres);
 
-        assert_eq!(scanner.mask_sample("abc"), "***");
-        assert_eq!(scanner.mask_sample("abcd"), "****");
-        assert_eq!(scanner.mask_sample("abcdefgh"), "ab***gh");
-        assert_eq!(scanner.mask_sample("test@example.com"), "tes***com");
-        assert_eq!(scanner.mask_sample("123-45-6789"), "123***789");
+        // Length is the only thing that survives; no window of the raw value.
+        assert_eq!(scanner.mask_sample("abc"), "*** (3 chars)");
+        assert_eq!(scanner.mask_sample("test@example.com"), "*** (16 chars)");
+
+        for value in [
+            "test@example.com",
+            "123-45-6789",
+            "4532-0151-1283-0366",
+            "Ariane Kowalczyk",
+        ] {
+            let masked = scanner.mask_sample(value);
+            for window in value
+                .chars()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|w| w.iter().collect::<String>())
+            {
+                assert!(
+                    !masked.contains(&window),
+                    "scan sample '{masked}' leaks '{window}' from '{value}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mask_sample_counts_characters_not_bytes() {
+        let scanner = DbScanner::new("localhost".to_string(), 5432, DbProtocol::Postgres);
+        assert_eq!(scanner.mask_sample("naïve café"), "*** (10 chars)");
     }
 }
