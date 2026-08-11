@@ -56,6 +56,9 @@ pub struct AppConfig {
     /// by IRONVEIL_BIND/IRONVEIL_PORT.
     #[serde(default)]
     pub listen: Option<ListenConfig>,
+    /// MySQL authentication handling: passthrough (default) or terminate.
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub api: Option<ApiConfig>,
     #[serde(default)]
@@ -248,6 +251,185 @@ impl Default for ApiConfig {
     }
 }
 
+/// How the proxy handles MySQL authentication.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Credential-transparent: the client's own MySQL credentials are
+    /// forwarded verbatim upstream. The default, and the only behaviour before
+    /// 0.3.0 — but it means the process exposed to clients necessarily handles
+    /// the real database password.
+    #[default]
+    Passthrough,
+    /// The proxy holds the upstream credential and authenticates its clients
+    /// against a separate local one. MySQL only.
+    Terminate,
+}
+
+/// Credentials for `auth.mode: terminate`.
+///
+/// Every secret can be given inline, from a file (for Kubernetes secret mounts
+/// and Docker secrets), or from the environment. Precedence for each secret is
+/// environment > file > inline, so a deployment can override a baked-in value
+/// without rewriting the config.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub mode: AuthMode,
+
+    /// Username clients must present. Env: IRONVEIL_CLIENT_USERNAME.
+    #[serde(default)]
+    pub client_username: Option<String>,
+    /// Password clients must present. Env: IRONVEIL_CLIENT_PASSWORD.
+    #[serde(default)]
+    pub client_password: Option<String>,
+    /// File to read the client password from (trailing newline trimmed).
+    #[serde(default)]
+    pub client_password_file: Option<String>,
+    /// Auth plugin offered to clients: `caching_sha2_password` (default) or
+    /// `mysql_native_password` for clients that lack the former.
+    #[serde(default)]
+    pub client_auth_plugin: Option<String>,
+
+    /// Username the proxy authenticates upstream with.
+    /// Env: IRONVEIL_UPSTREAM_USERNAME.
+    #[serde(default)]
+    pub upstream_username: Option<String>,
+    /// Password the proxy authenticates upstream with.
+    /// Env: IRONVEIL_UPSTREAM_PASSWORD.
+    #[serde(default)]
+    pub upstream_password: Option<String>,
+    /// File to read the upstream password from (trailing newline trimmed).
+    #[serde(default)]
+    pub upstream_password_file: Option<String>,
+    /// Default schema to select upstream when the client does not name one.
+    #[serde(default)]
+    pub upstream_database: Option<String>,
+}
+
+/// Auth settings with every secret resolved, built once at startup.
+///
+/// Deliberately not re-read on config hot-reload: swapping the credential out
+/// from under connections mid-flight has no coherent meaning, and a reload that
+/// silently changed who may connect would be a poor security property.
+#[derive(Debug, Clone)]
+pub struct ResolvedAuth {
+    pub client_username: String,
+    pub client_password: String,
+    pub client_auth_plugin: String,
+    pub upstream_username: String,
+    pub upstream_password: String,
+    pub upstream_database: Option<String>,
+}
+
+/// Resolve one secret from environment > file > inline.
+fn resolve_secret(
+    env: Option<String>,
+    file: Option<&str>,
+    inline: Option<&str>,
+    what: &str,
+) -> Result<Option<String>> {
+    if let Some(value) = env {
+        return Ok(Some(value));
+    }
+    if let Some(path) = file {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read {what} from '{path}': {e}"))?;
+        // Secret files are almost always written with a trailing newline;
+        // including it in the password is never what the operator meant.
+        return Ok(Some(raw.trim_end_matches(['\n', '\r']).to_string()));
+    }
+    Ok(inline.map(|s| s.to_string()))
+}
+
+impl AuthConfig {
+    /// Resolve credentials from the config, the named files and the
+    /// environment. `env` is passed in rather than read here so the precedence
+    /// rules can be tested without mutating process-global state.
+    pub fn resolve_with(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<ResolvedAuth>> {
+        if self.mode == AuthMode::Passthrough {
+            return Ok(None);
+        }
+
+        let client_username = env("IRONVEIL_CLIENT_USERNAME")
+            .or_else(|| self.client_username.clone())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("auth.mode is 'terminate' but auth.client_username is not set")
+            })?;
+
+        let client_password = resolve_secret(
+            env("IRONVEIL_CLIENT_PASSWORD"),
+            self.client_password_file.as_deref(),
+            self.client_password.as_deref(),
+            "auth.client_password",
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "auth.mode is 'terminate' but no client password is configured \
+                 (auth.client_password, auth.client_password_file or IRONVEIL_CLIENT_PASSWORD)"
+            )
+        })?;
+
+        // An empty password on a listening port authenticates anyone who can
+        // reach it. The local credential is a throwaway, but it is the only
+        // thing standing between a co-located process and unmasked-adjacent
+        // access, so refuse rather than warn.
+        if client_password.is_empty() {
+            anyhow::bail!("auth.client_password must not be empty in 'terminate' mode");
+        }
+
+        let upstream_username = env("IRONVEIL_UPSTREAM_USERNAME")
+            .or_else(|| self.upstream_username.clone())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("auth.mode is 'terminate' but auth.upstream_username is not set")
+            })?;
+
+        // The upstream password may legitimately be empty (socket-auth style
+        // accounts), so its absence is not an error.
+        let upstream_password = resolve_secret(
+            env("IRONVEIL_UPSTREAM_PASSWORD"),
+            self.upstream_password_file.as_deref(),
+            self.upstream_password.as_deref(),
+            "auth.upstream_password",
+        )?
+        .unwrap_or_default();
+
+        let client_auth_plugin = self
+            .client_auth_plugin
+            .clone()
+            .unwrap_or_else(|| "caching_sha2_password".to_string());
+        if !KNOWN_CLIENT_AUTH_PLUGINS.contains(&client_auth_plugin.as_str()) {
+            anyhow::bail!(
+                "unknown auth.client_auth_plugin '{client_auth_plugin}' (known: {})",
+                KNOWN_CLIENT_AUTH_PLUGINS.join(", ")
+            );
+        }
+
+        Ok(Some(ResolvedAuth {
+            client_username,
+            client_password,
+            client_auth_plugin,
+            upstream_username,
+            upstream_password,
+            upstream_database: self.upstream_database.clone(),
+        }))
+    }
+
+    /// Resolve against the real process environment.
+    pub fn resolve(&self) -> Result<Option<ResolvedAuth>> {
+        self.resolve_with(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
+    }
+}
+
+/// Auth plugins the proxy can offer to its own clients.
+pub const KNOWN_CLIENT_AUTH_PLUGINS: &[&str] = &["caching_sha2_password", "mysql_native_password"];
+
 /// Where the proxy's own listener binds. Every field is optional so the CLI
 /// flag and the environment can override it — see `resolve_listen_addr`.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -394,6 +576,7 @@ impl Default for AppConfig {
             upstream_tls: false,
             telemetry: None,
             listen: None,
+            auth: None,
             api: None,
             limits: None,
             health_check: None,
@@ -616,6 +799,171 @@ mod tests {
         assert!(!resolve_flag(None, None, Some(false), true, "api").unwrap());
         assert!(resolve_flag(None, None, None, true, "api").unwrap());
         assert!(resolve_flag(None, Some("maybe"), None, true, "api").is_err());
+    }
+
+    fn terminate_config() -> AuthConfig {
+        AuthConfig {
+            mode: AuthMode::Terminate,
+            client_username: Some("door".to_string()),
+            client_password: Some("inline-client".to_string()),
+            upstream_username: Some("support_ro".to_string()),
+            upstream_password: Some("inline-upstream".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn test_auth_defaults_to_passthrough_and_resolves_to_nothing() {
+        let config: AppConfig = serde_yaml_ng::from_str("rules: []\n").unwrap();
+        assert!(config.auth.is_none());
+
+        let parsed: AppConfig = serde_yaml_ng::from_str("rules: []\nauth: {}\n").unwrap();
+        let auth = parsed.auth.expect("auth section");
+        assert_eq!(auth.mode, AuthMode::Passthrough);
+        assert!(
+            auth.resolve_with(no_env).unwrap().is_none(),
+            "passthrough must not resolve credentials"
+        );
+    }
+
+    #[test]
+    fn test_terminate_resolves_inline_credentials() {
+        let resolved = terminate_config()
+            .resolve_with(no_env)
+            .unwrap()
+            .expect("terminate mode should resolve credentials");
+
+        assert_eq!(resolved.client_username, "door");
+        assert_eq!(resolved.client_password, "inline-client");
+        assert_eq!(resolved.upstream_username, "support_ro");
+        assert_eq!(resolved.upstream_password, "inline-upstream");
+        assert_eq!(resolved.client_auth_plugin, "caching_sha2_password");
+    }
+
+    #[test]
+    fn test_environment_overrides_inline_credentials() {
+        let resolved = terminate_config()
+            .resolve_with(|name| match name {
+                "IRONVEIL_CLIENT_PASSWORD" => Some("from-env".to_string()),
+                "IRONVEIL_UPSTREAM_USERNAME" => Some("env_user".to_string()),
+                _ => None,
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.client_password, "from-env");
+        assert_eq!(resolved.upstream_username, "env_user");
+        // Untouched fields still come from the file.
+        assert_eq!(resolved.upstream_password, "inline-upstream");
+    }
+
+    #[test]
+    fn test_password_file_is_read_and_trailing_newline_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.pw");
+        std::fs::write(&path, "secret-from-file\n").unwrap();
+
+        let mut config = terminate_config();
+        config.client_password_file = Some(path.to_string_lossy().into_owned());
+
+        let resolved = config.resolve_with(no_env).unwrap().unwrap();
+        assert_eq!(
+            resolved.client_password, "secret-from-file",
+            "the trailing newline a secret file always has must not be part of the password"
+        );
+    }
+
+    #[test]
+    fn test_environment_beats_the_password_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.pw");
+        std::fs::write(&path, "from-file").unwrap();
+
+        let mut config = terminate_config();
+        config.client_password_file = Some(path.to_string_lossy().into_owned());
+
+        let resolved = config
+            .resolve_with(|name| {
+                (name == "IRONVEIL_CLIENT_PASSWORD").then(|| "from-env".to_string())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.client_password, "from-env");
+    }
+
+    #[test]
+    fn test_missing_password_file_is_an_error_not_a_silent_empty_password() {
+        let mut config = terminate_config();
+        config.client_password = None;
+        config.client_password_file = Some("/nonexistent/iron-veil/client.pw".to_string());
+
+        let err = config.resolve_with(no_env).unwrap_err();
+        assert!(err.to_string().contains("failed to read"), "got: {err}");
+    }
+
+    #[test]
+    fn test_terminate_rejects_incomplete_configuration() {
+        let mut missing_client_user = terminate_config();
+        missing_client_user.client_username = None;
+        assert!(missing_client_user.resolve_with(no_env).is_err());
+
+        let mut missing_client_pw = terminate_config();
+        missing_client_pw.client_password = None;
+        assert!(missing_client_pw.resolve_with(no_env).is_err());
+
+        // An empty client password would authenticate anyone who can reach
+        // the port.
+        let mut empty_client_pw = terminate_config();
+        empty_client_pw.client_password = Some(String::new());
+        assert!(empty_client_pw.resolve_with(no_env).is_err());
+
+        let mut missing_upstream_user = terminate_config();
+        missing_upstream_user.upstream_username = None;
+        assert!(missing_upstream_user.resolve_with(no_env).is_err());
+    }
+
+    #[test]
+    fn test_empty_upstream_password_is_allowed() {
+        let mut config = terminate_config();
+        config.upstream_password = None;
+        let resolved = config.resolve_with(no_env).unwrap().unwrap();
+        assert_eq!(resolved.upstream_password, "");
+    }
+
+    #[test]
+    fn test_unknown_client_auth_plugin_is_rejected() {
+        let mut config = terminate_config();
+        config.client_auth_plugin = Some("sha256_password".to_string());
+        let err = config.resolve_with(no_env).unwrap_err();
+        assert!(err.to_string().contains("sha256_password"), "got: {err}");
+    }
+
+    #[test]
+    fn test_auth_section_parses_from_yaml() {
+        let yaml = r#"
+rules: []
+auth:
+  mode: terminate
+  client_username: door
+  client_password: local-throwaway
+  client_auth_plugin: mysql_native_password
+  upstream_username: support_ro
+  upstream_password_file: /run/secrets/db
+  upstream_database: wms
+"#;
+        let config: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let auth = config.auth.expect("auth section");
+        assert_eq!(auth.mode, AuthMode::Terminate);
+        assert_eq!(auth.client_username.as_deref(), Some("door"));
+        assert_eq!(
+            auth.upstream_password_file.as_deref(),
+            Some("/run/secrets/db")
+        );
+        assert_eq!(auth.upstream_database.as_deref(), Some("wms"));
     }
 
     #[test]

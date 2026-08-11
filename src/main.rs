@@ -6,7 +6,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info, info_span, warn};
 
-use iron_veil::{api, config, interceptor, metrics, protocol, state, telemetry};
+use iron_veil::{api, auth, config, interceptor, metrics, protocol, state, telemetry};
 
 use crate::config::AppConfig;
 use crate::interceptor::{Anonymizer, MySqlAnonymizer, MySqlPacketInterceptor, PacketInterceptor};
@@ -698,6 +698,39 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Resolve the terminating-auth credentials once, at startup: a credential
+    // that changed under a hot config reload would silently change who may
+    // connect, and mid-flight connections could not act on it anyway.
+    let terminating_auth = match config.auth.as_ref().map(|a| a.resolve()).transpose()? {
+        Some(Some(resolved)) => {
+            if !matches!(args.protocol, DbProtocol::Mysql) {
+                anyhow::bail!(
+                    "auth.mode 'terminate' is MySQL-only; this instance is proxying {:?}",
+                    args.protocol
+                );
+            }
+            info!(
+                client_user = %resolved.client_username,
+                client_plugin = %resolved.client_auth_plugin,
+                upstream_user = %resolved.upstream_username,
+                "Terminating MySQL authentication at the proxy; \
+                 clients never see the upstream credential"
+            );
+            if !config.upstream_tls {
+                // Not fatal: the credential may already be cached upstream, or
+                // the account may use mysql_native_password. But full auth will
+                // fail, and that failure is confusing without this warning.
+                warn!(
+                    "auth.mode is 'terminate' but upstream_tls is false: the proxy's own \
+                     credential can only authenticate if the upstream has it cached or the \
+                     account uses mysql_native_password"
+                );
+            }
+            Some(Arc::new(TerminatingAuth::from_resolved(&resolved)?))
+        }
+        _ => None,
+    };
+
     // Build the upstream TLS client config once: it loads the OS trust store,
     // which is too expensive (and too panic-prone) for the per-connection path.
     let upstream_tls_config = if config.upstream_tls {
@@ -804,6 +837,7 @@ async fn main() -> Result<()> {
                 let tls_acceptor = tls_acceptor.clone();
                 let upstream_pool = upstream_pool.clone();
                 let upstream_tls_config = upstream_tls_config.clone();
+                let terminating_auth = terminating_auth.clone();
                 let conn_cancel = cancel_token.child_token();
 
                 tokio::spawn(async move {
@@ -903,6 +937,7 @@ async fn main() -> Result<()> {
                                     state.clone(),
                                     tls_acceptor,
                                     upstream_tls_config,
+                                    terminating_auth,
                                     conn_cancel,
                                 )
                                 .await
@@ -1519,6 +1554,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedStream<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_mysql_connection(
     client_socket: tokio::net::TcpStream,
     upstream_host: String,
@@ -1526,6 +1562,7 @@ async fn process_mysql_connection(
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
+    terminating_auth: Option<Arc<TerminatingAuth>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     // Get timeout configuration
@@ -1547,9 +1584,296 @@ async fn process_mysql_connection(
         idle_timeout,
         tls_acceptor,
         upstream_tls_config,
+        terminating_auth,
         cancel,
     )
     .await
+}
+
+/// Credentials for `auth.mode: terminate`, resolved once at startup.
+#[derive(Debug, Clone)]
+struct TerminatingAuth {
+    client_username: String,
+    client_password: String,
+    client_plugin: crate::auth::AuthPlugin,
+    upstream_username: String,
+    upstream_password: String,
+    upstream_database: Option<String>,
+}
+
+impl TerminatingAuth {
+    fn from_resolved(resolved: &crate::config::ResolvedAuth) -> Result<Self> {
+        let client_plugin = crate::auth::AuthPlugin::from_name(&resolved.client_auth_plugin)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported auth.client_auth_plugin '{}'",
+                    resolved.client_auth_plugin
+                )
+            })?;
+        Ok(Self {
+            client_username: resolved.client_username.clone(),
+            client_password: resolved.client_password.clone(),
+            client_plugin,
+            upstream_username: resolved.upstream_username.clone(),
+            upstream_password: resolved.upstream_password.clone(),
+            upstream_database: resolved.upstream_database.clone(),
+        })
+    }
+}
+
+/// Capability flags for the proxy's own upstream handshake response.
+///
+/// Shape-affecting bits — CLIENT_DEPRECATE_EOF above all, but also
+/// CLIENT_PROTOCOL_41 and the multi-result bits — must match what the client
+/// negotiated. If the two legs disagree, the upstream sends packets in a layout
+/// the client is not expecting, and since column definitions and result-set
+/// terminators are forwarded verbatim the mismatch surfaces as a corrupt result
+/// set rather than a clean error. Starting from the client's own flags and
+/// intersecting with the server's keeps them in step by construction.
+///
+/// The proxy then overrides the handful of bits it owns regardless of what
+/// either side asked for: it never negotiates compression (the codec cannot
+/// frame a compressed stream, so masking would silently stop applying), it
+/// decides its own TLS, and it re-encodes the response from fields — so the
+/// CONNECT_ATTRS bit must be off, since there is no attribute block to match it.
+fn negotiate_upstream_capabilities(
+    client_caps: u32,
+    server_caps: u32,
+    with_database: bool,
+    tls: bool,
+) -> u32 {
+    use crate::protocol::mysql::{
+        CLIENT_COMPRESS, CLIENT_CONNECT_ATTRS, CLIENT_CONNECT_WITH_DB, CLIENT_PLUGIN_AUTH,
+        CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION, CLIENT_SSL,
+    };
+
+    let mut caps = client_caps & server_caps;
+    caps &= !(CLIENT_SSL | CLIENT_COMPRESS | CLIENT_CONNECT_WITH_DB | CLIENT_CONNECT_ATTRS);
+    caps |= CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+    if with_database {
+        caps |= CLIENT_CONNECT_WITH_DB;
+    }
+    if tls {
+        caps |= CLIENT_SSL;
+    }
+    caps
+}
+
+/// Verify the client's credential against the locally-configured one.
+///
+/// Returns the sequence id of the last client packet on success, or `None`
+/// after writing an access-denied ERR (the caller should close the connection).
+async fn authenticate_client(
+    client_framed: &mut Framed<BoxedStream, MySqlCodec>,
+    auth: &TerminatingAuth,
+    response: &crate::protocol::mysql::HandshakeResponse,
+    nonce: &[u8],
+    first_seq: u8,
+    cancel: &CancellationToken,
+) -> Result<Option<u8>> {
+    let mut seq = first_seq;
+    let mut scramble = response.auth_response.clone();
+
+    // A client that guessed a different plugin — because it defaulted, or
+    // because it cached the upstream's choice — is asked to switch. This is the
+    // ordinary MySQL flow, not an error.
+    let offered = response.auth_plugin_name.as_deref().unwrap_or_default();
+    if offered != auth.client_plugin.name() {
+        tracing::debug!(
+            requested = offered,
+            switching_to = auth.client_plugin.name(),
+            "asking client to switch auth plugin"
+        );
+        seq = seq.wrapping_add(1);
+        client_framed.codec_mut().set_auth_response_state();
+        client_framed
+            .send(MySqlMessage::Generic(
+                crate::protocol::mysql::GenericPacket {
+                    sequence_id: seq,
+                    payload: bytes::BytesMut::from(
+                        &crate::auth::build_auth_switch_request(auth.client_plugin, nonce)[..],
+                    ),
+                },
+            ))
+            .await?;
+
+        match auth_step(
+            cancel,
+            "the client auth-switch response",
+            client_framed.next(),
+        )
+        .await?
+        {
+            Some(Ok(MySqlMessage::Generic(g))) => {
+                seq = g.sequence_id;
+                scramble = g.payload.to_vec();
+            }
+            Some(Ok(other)) => {
+                anyhow::bail!("expected an auth-switch response, got {other:?}")
+            }
+            Some(Err(e)) => return Err(e),
+            None => return Ok(None),
+        }
+    }
+
+    let username_ok = response.username == auth.client_username;
+    let password_ok =
+        crate::auth::verify_scramble(auth.client_plugin, &auth.client_password, nonce, &scramble);
+
+    // Deliberately one message for both failures: distinguishing "no such user"
+    // from "wrong password" turns the port into a username oracle, and MySQL
+    // itself does not distinguish them either.
+    if !username_ok || !password_ok {
+        tracing::warn!(
+            username = %response.username,
+            "client authentication rejected"
+        );
+        metrics::record_client_auth(false);
+        client_framed
+            .send(MySqlMessage::Err(
+                crate::protocol::mysql::ErrPacket::proxy_error(
+                    seq.wrapping_add(1),
+                    1045, // ER_ACCESS_DENIED_ERROR
+                    b"28000",
+                    &format!("Access denied for user '{}' (iron-veil)", response.username),
+                ),
+            ))
+            .await?;
+        return Ok(None);
+    }
+
+    metrics::record_client_auth(true);
+    Ok(Some(seq))
+}
+
+/// Authenticate to the upstream server with the proxy's own credential.
+#[allow(clippy::too_many_arguments)]
+async fn authenticate_upstream(
+    upstream_framed: &mut Framed<BoxedStream, MySqlCodec>,
+    auth: &TerminatingAuth,
+    handshake: &crate::protocol::mysql::HandshakeV10,
+    capabilities: u32,
+    database: Option<String>,
+    character_set: u8,
+    max_packet_size: u32,
+    response_seq: u8,
+    tls: bool,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let mut nonce = crate::auth::nonce_from_handshake(
+        &handshake.auth_plugin_data_part1,
+        &handshake.auth_plugin_data_part2,
+    );
+    // An upstream advertising a plugin this build does not implement (e.g.
+    // sha256_password) still usually accepts caching_sha2_password, and will
+    // send an AuthSwitchRequest if it does not — which the loop below handles.
+    let mut plugin = crate::auth::AuthPlugin::from_name(&handshake.auth_plugin_name)
+        .unwrap_or(crate::auth::AuthPlugin::CachingSha2Password);
+
+    let payload = crate::protocol::mysql::build_handshake_response_payload(
+        &crate::protocol::mysql::HandshakeResponse {
+            capability_flags: capabilities,
+            max_packet_size,
+            character_set,
+            username: auth.upstream_username.clone(),
+            auth_response: crate::auth::scramble(plugin, &auth.upstream_password, &nonce),
+            database,
+            auth_plugin_name: Some(plugin.name().to_string()),
+            raw: Bytes::new(),
+        },
+    );
+    upstream_framed.codec_mut().set_auth_response_state();
+    upstream_framed
+        .send(MySqlMessage::Generic(
+            crate::protocol::mysql::GenericPacket {
+                sequence_id: response_seq,
+                payload,
+            },
+        ))
+        .await?;
+
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        if rounds > 20 {
+            anyhow::bail!("upstream authentication exceeded 20 round trips");
+        }
+
+        match auth_step(cancel, "the upstream auth response", upstream_framed.next()).await? {
+            Some(Ok(MySqlMessage::Ok(_))) => return Ok(()),
+            Some(Ok(MySqlMessage::Err(e))) => {
+                anyhow::bail!(
+                    "upstream rejected the proxy credential for user '{}': {} ({})",
+                    auth.upstream_username,
+                    e.error_message,
+                    e.error_code
+                )
+            }
+            Some(Ok(MySqlMessage::Generic(g))) => {
+                let reply_seq = g.sequence_id.wrapping_add(1);
+
+                if let Ok((name, new_nonce)) = crate::auth::parse_auth_switch_request(&g.payload) {
+                    plugin = crate::auth::AuthPlugin::from_name(&name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "upstream asked for auth plugin '{name}', which iron-veil does not \
+                             implement; grant the proxy account caching_sha2_password or \
+                             mysql_native_password"
+                        )
+                    })?;
+                    nonce = new_nonce;
+                    let scramble = crate::auth::scramble(plugin, &auth.upstream_password, &nonce);
+                    upstream_framed
+                        .send(MySqlMessage::Generic(
+                            crate::protocol::mysql::GenericPacket {
+                                sequence_id: reply_seq,
+                                payload: bytes::BytesMut::from(&scramble[..]),
+                            },
+                        ))
+                        .await?;
+                    continue;
+                }
+
+                match crate::auth::classify_auth_more_data(&g.payload) {
+                    // The server had the credential cached; OK follows with no
+                    // reply from us.
+                    Some(crate::auth::AuthMoreData::FastAuthSuccess) => continue,
+                    Some(crate::auth::AuthMoreData::FullAuthRequired) => {
+                        // Full auth sends the password in the clear. MySQL only
+                        // accepts that on a secure channel, and iron-veil will
+                        // not send it on an insecure one regardless.
+                        if !tls {
+                            anyhow::bail!(
+                                "upstream requires full authentication for user '{}' but \
+                                 upstream_tls is false; full auth transmits the password in \
+                                 cleartext, so set upstream_tls: true",
+                                auth.upstream_username
+                            );
+                        }
+                        let payload =
+                            crate::auth::build_cleartext_password(&auth.upstream_password);
+                        upstream_framed
+                            .send(MySqlMessage::Generic(
+                                crate::protocol::mysql::GenericPacket {
+                                    sequence_id: reply_seq,
+                                    payload: bytes::BytesMut::from(&payload[..]),
+                                },
+                            ))
+                            .await?;
+                        continue;
+                    }
+                    Some(crate::auth::AuthMoreData::Other) | None => {
+                        anyhow::bail!(
+                            "unexpected packet during upstream authentication (first byte {:#04x})",
+                            g.payload.first().copied().unwrap_or_default()
+                        )
+                    }
+                }
+            }
+            Some(Ok(other)) => anyhow::bail!("unexpected message during upstream auth: {other:?}"),
+            Some(Err(e)) => return Err(e),
+            None => anyhow::bail!("upstream closed the connection during authentication"),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1561,6 +1885,7 @@ async fn handle_mysql_protocol(
     idle_timeout: Duration,
     tls_acceptor: Option<TlsAcceptor>,
     upstream_tls_config: Option<Arc<ClientConfig>>,
+    terminating_auth: Option<Arc<TerminatingAuth>>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let upstream_tls_required = {
@@ -1576,8 +1901,14 @@ async fn handle_mysql_protocol(
     // Start of the in-flight query, for the round-trip latency histogram.
     let mut query_started_at: Option<Instant> = None;
 
-    // Phase 1: Forward handshake from upstream to client
-    let handshake = match upstream_framed.next().await {
+    // Phase 1: build the handshake the client sees from the upstream one.
+    //
+    // Reusing the upstream's capability flags is deliberate even in terminating
+    // mode: the shape-affecting bits (CLIENT_DEPRECATE_EOF above all) must be
+    // consistent across both legs or the verbatim passthrough of column
+    // definitions and result-set terminators breaks. Only the auth material and
+    // the bits the proxy itself must control are changed.
+    let (handshake, client_nonce) = match upstream_framed.next().await {
         Some(Ok(MySqlMessage::Handshake(h))) => {
             info!(server_version = %h.server_version, "Received MySQL handshake from upstream");
             // Advertise to the client only what this proxy can actually serve:
@@ -1592,10 +1923,33 @@ async fn handle_mysql_protocol(
             } else {
                 client_handshake.capability_flags &= !crate::protocol::mysql::CLIENT_SSL;
             }
+
+            // In terminating mode the client authenticates against the proxy,
+            // so it gets the proxy's own nonce and plugin — never the
+            // upstream's, which would let it compute a scramble valid upstream.
+            let nonce = match terminating_auth.as_ref() {
+                Some(auth) => {
+                    let nonce = crate::auth::generate_nonce();
+                    client_handshake
+                        .auth_plugin_data_part1
+                        .copy_from_slice(&nonce[..8]);
+                    client_handshake.auth_plugin_data_part2 = nonce[8..].to_vec();
+                    client_handshake.auth_plugin_name = auth.client_plugin.name().to_string();
+                    client_handshake.capability_flags |= crate::protocol::mysql::CLIENT_PLUGIN_AUTH
+                        | crate::protocol::mysql::CLIENT_SECURE_CONNECTION
+                        | crate::protocol::mysql::CLIENT_PROTOCOL_41;
+                    // The surgical encoder path only patches capability bits;
+                    // changed auth material has to be re-encoded from fields.
+                    client_handshake.raw = Bytes::new();
+                    Some(nonce)
+                }
+                None => None,
+            };
+
             client_framed
                 .send(MySqlMessage::Handshake(client_handshake))
                 .await?;
-            h
+            (h, nonce)
         }
         Some(Ok(other)) => {
             tracing::warn!("Expected handshake, got {:?}", other);
@@ -1632,10 +1986,12 @@ async fn handle_mysql_protocol(
         None => return Ok(()),
     };
 
+    let mut client_used_tls = false;
     if client_response.is_ssl_request() {
         let Some(acceptor) = tls_acceptor else {
             anyhow::bail!("client requested TLS but no TLS acceptor is configured");
         };
+        client_used_tls = true;
         let negotiated_caps = client_response.capability_flags;
 
         // Re-wrap the client socket, carrying over anything Framed had already
@@ -1673,6 +2029,41 @@ async fn handle_mysql_protocol(
 
     info!(username = %client_response.username, database = ?client_response.database,
           "Received client handshake response");
+
+    // Terminating mode: authenticate the client against the local credential
+    // here, before a single byte of the proxy's own credential is used. The
+    // client is not told the outcome yet — a client that says OK and then
+    // immediately errors because the *upstream* rejected the proxy is worse
+    // than one that simply never authenticated — so success only unlocks the
+    // upstream leg below.
+    let client_auth_seq = if let Some(auth) = terminating_auth.as_ref() {
+        client_framed
+            .codec_mut()
+            .set_capability_flags(client_response.capability_flags);
+        let nonce = client_nonce
+            .as_deref()
+            .expect("terminating mode always generates a client nonce");
+        // Handshake is sequence 0, so the client's response is 1 — or 2 when
+        // an SSLRequest went first.
+        let first_seq = if client_used_tls { 2 } else { 1 };
+
+        match authenticate_client(
+            &mut client_framed,
+            auth,
+            &client_response,
+            nonce,
+            first_seq,
+            &cancel,
+        )
+        .await?
+        {
+            Some(seq) => Some(seq),
+            // Rejected; the ERR packet is already on the wire.
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
 
     // Upstream TLS leg. MySQL 8.4's default caching_sha2_password sends the
     // password in cleartext during full auth and the server rejects that on an
@@ -1721,69 +2112,175 @@ async fn handle_mysql_protocol(
     client_framed
         .codec_mut()
         .set_capability_flags(client_response.capability_flags);
-    upstream_framed
-        .codec_mut()
-        .set_capability_flags(client_response.capability_flags);
-    upstream_framed
-        .send(MySqlMessage::HandshakeResponse(client_response))
-        .await?;
 
-    // Phase 3: relay the authentication exchange verbatim until it resolves.
-    // caching_sha2_password needs several round trips (auth switch, fast-auth
-    // result, public-key request, full auth); handling only one packet left
-    // every non-cached credential unable to connect.
-    let mut auth_rounds = 0;
-    loop {
-        auth_rounds += 1;
-        if auth_rounds > 20 {
-            anyhow::bail!("MySQL authentication exceeded 20 round trips");
+    // Phase 3: authentication upstream.
+    match terminating_auth.as_ref() {
+        // Terminating mode: the proxy is the client here, using its own
+        // credential. The real client never sees the upstream nonce and never
+        // sends a scramble that would be valid against the database.
+        Some(auth) => {
+            let database = client_response
+                .database
+                .clone()
+                .filter(|db| !db.is_empty())
+                .or_else(|| auth.upstream_database.clone());
+            let upstream_caps = negotiate_upstream_capabilities(
+                client_response.capability_flags,
+                handshake.capability_flags,
+                database.is_some(),
+                upstream_tls_required,
+            );
+            upstream_framed
+                .codec_mut()
+                .set_capability_flags(upstream_caps);
+
+            if let Err(err) = authenticate_upstream(
+                &mut upstream_framed,
+                auth,
+                &handshake,
+                upstream_caps,
+                database,
+                client_response.character_set,
+                client_response.max_packet_size,
+                // Handshake is 0, so our response is 1 — or 2 when we sent an
+                // SSLRequest first.
+                if upstream_tls_required { 2 } else { 1 },
+                upstream_tls_required,
+                &cancel,
+            )
+            .await
+            {
+                // The client authenticated fine; it is the proxy's own upstream
+                // credential that failed. Say so plainly rather than echoing the
+                // server's access-denied, which names the *proxy's* account and
+                // reads as if the client's own credential was rejected.
+                tracing::error!(error = %err, "upstream authentication failed");
+                let seq = client_auth_seq.unwrap_or(1).wrapping_add(1);
+                let _ = client_framed
+                    .send(MySqlMessage::Err(
+                        crate::protocol::mysql::ErrPacket::proxy_error(
+                            seq,
+                            1045,
+                            b"28000",
+                            "iron-veil could not authenticate to the upstream database",
+                        ),
+                    ))
+                    .await;
+                return Err(err);
+            }
+
+            // Both legs are up. Only now is the client told it is in.
+            let mut seq = client_auth_seq.unwrap_or(1).wrapping_add(1);
+            if auth.client_plugin == crate::auth::AuthPlugin::CachingSha2Password {
+                client_framed
+                    .send(MySqlMessage::Generic(
+                        crate::protocol::mysql::GenericPacket {
+                            sequence_id: seq,
+                            payload: bytes::BytesMut::from(
+                                &crate::auth::build_fast_auth_success()[..],
+                            ),
+                        },
+                    ))
+                    .await?;
+                seq = seq.wrapping_add(1);
+            }
+            client_framed
+                .send(MySqlMessage::Ok(crate::protocol::mysql::OkPacket {
+                    sequence_id: seq,
+                    affected_rows: 0,
+                    last_insert_id: 0,
+                    status_flags: crate::protocol::mysql::SERVER_STATUS_AUTOCOMMIT,
+                    warnings: 0,
+                    info: Bytes::new(),
+                    raw: Bytes::new(),
+                }))
+                .await?;
+            info!(
+                client_user = %auth.client_username,
+                upstream_user = %auth.upstream_username,
+                "MySQL authentication terminated at the proxy"
+            );
         }
 
-        match auth_step(
-            &cancel,
-            "the upstream auth response",
-            upstream_framed.next(),
-        )
-        .await?
-        {
-            Some(Ok(msg @ MySqlMessage::Ok(_))) => {
-                info!("MySQL authentication successful");
-                client_framed.send(msg).await?;
-                break;
-            }
-            Some(Ok(MySqlMessage::Err(e))) => {
-                tracing::warn!(error_code = e.error_code, "MySQL authentication failed");
-                client_framed.send(MySqlMessage::Err(e)).await?;
-                return Ok(());
-            }
-            Some(Ok(other)) => {
-                // Intermediate auth packet (AuthMoreData / AuthSwitchRequest).
-                // Forward to the client, but only wait for a client reply when
-                // the protocol actually requires one. caching_sha2_password
-                // fast-auth success (0x01 0x03) is followed immediately by OK
-                // with no client bytes — waiting hangs every successful MySQL 8
-                // login through the proxy.
-                let expects_reply = match &other {
-                    MySqlMessage::Generic(g) => {
-                        crate::protocol::mysql::auth_packet_expects_client_reply(&g.payload)
+        // Passthrough mode: relay the authentication exchange verbatim until it
+        // resolves. caching_sha2_password needs several round trips (auth
+        // switch, fast-auth result, public-key request, full auth); handling
+        // only one packet left every non-cached credential unable to connect.
+        None => {
+            upstream_framed
+                .codec_mut()
+                .set_capability_flags(client_response.capability_flags);
+            // The response's sequence id is 2, not 1, when the proxy sent an
+            // SSLRequest first; MySQL answers a mismatch with
+            // ER_NET_PACKETS_OUT_OF_ORDER and drops the connection.
+            let raw = client_response.raw.clone();
+            upstream_framed
+                .send(MySqlMessage::Generic(
+                    crate::protocol::mysql::GenericPacket {
+                        sequence_id: if upstream_tls_required { 2 } else { 1 },
+                        payload: bytes::BytesMut::from(&raw[..]),
+                    },
+                ))
+                .await?;
+
+            let mut auth_rounds = 0;
+            loop {
+                auth_rounds += 1;
+                if auth_rounds > 20 {
+                    anyhow::bail!("MySQL authentication exceeded 20 round trips");
+                }
+
+                match auth_step(
+                    &cancel,
+                    "the upstream auth response",
+                    upstream_framed.next(),
+                )
+                .await?
+                {
+                    Some(Ok(msg @ MySqlMessage::Ok(_))) => {
+                        info!("MySQL authentication successful");
+                        client_framed.send(msg).await?;
+                        break;
                     }
-                    // Parsed OK/ERR are handled above; anything else during auth
-                    // is treated as needing a client reply.
-                    _ => true,
-                };
-                client_framed.send(other).await?;
-                if expects_reply {
-                    match auth_step(&cancel, "the client auth response", client_framed.next())
-                        .await?
-                    {
-                        Some(Ok(reply)) => upstream_framed.send(reply).await?,
-                        Some(Err(e)) => return Err(e),
-                        None => return Ok(()),
+                    Some(Ok(MySqlMessage::Err(e))) => {
+                        tracing::warn!(error_code = e.error_code, "MySQL authentication failed");
+                        client_framed.send(MySqlMessage::Err(e)).await?;
+                        return Ok(());
                     }
+                    Some(Ok(other)) => {
+                        // Intermediate auth packet (AuthMoreData / AuthSwitchRequest).
+                        // Forward to the client, but only wait for a client reply when
+                        // the protocol actually requires one. caching_sha2_password
+                        // fast-auth success (0x01 0x03) is followed immediately by OK
+                        // with no client bytes — waiting hangs every successful MySQL 8
+                        // login through the proxy.
+                        let expects_reply = match &other {
+                            MySqlMessage::Generic(g) => {
+                                crate::protocol::mysql::auth_packet_expects_client_reply(&g.payload)
+                            }
+                            // Parsed OK/ERR are handled above; anything else during auth
+                            // is treated as needing a client reply.
+                            _ => true,
+                        };
+                        client_framed.send(other).await?;
+                        if expects_reply {
+                            match auth_step(
+                                &cancel,
+                                "the client auth response",
+                                client_framed.next(),
+                            )
+                            .await?
+                            {
+                                Some(Ok(reply)) => upstream_framed.send(reply).await?,
+                                Some(Err(e)) => return Err(e),
+                                None => return Ok(()),
+                            }
+                        }
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => return Ok(()),
                 }
             }
-            Some(Err(e)) => return Err(e),
-            None => return Ok(()),
         }
     }
 
@@ -1935,13 +2432,17 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
 mod tests {
     use super::{
         UpstreamPoolAcquireError, UpstreamSlotManager, auth_step, build_mysql_err_packet,
-        build_postgres_fatal_error_packet, drain_connections, redact_sql_literals,
-        resolve_timeout_limits,
+        build_postgres_fatal_error_packet, drain_connections, negotiate_upstream_capabilities,
+        redact_sql_literals, resolve_timeout_limits,
     };
     use crate::config::LimitsConfig;
+    use anyhow::Result;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio_rustls::rustls::ClientConfig;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -2019,6 +2520,72 @@ mod tests {
 
         drop(lease);
         assert_eq!(manager.available_slots(), 1);
+    }
+
+    #[test]
+    fn test_upstream_capabilities_track_the_client_for_shape_bits() {
+        use crate::protocol::mysql::{
+            CLIENT_DEPRECATE_EOF, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION,
+        };
+
+        let server = u32::MAX;
+
+        // A client that negotiated DEPRECATE_EOF must have it negotiated
+        // upstream too: the terminator's shape differs, and it is forwarded
+        // verbatim, so a mismatch corrupts every result set.
+        let caps = negotiate_upstream_capabilities(
+            CLIENT_PROTOCOL_41 | CLIENT_DEPRECATE_EOF,
+            server,
+            false,
+            false,
+        );
+        assert_ne!(caps & CLIENT_DEPRECATE_EOF, 0);
+
+        // ...and a client that did not must not have it set upstream.
+        let caps = negotiate_upstream_capabilities(CLIENT_PROTOCOL_41, server, false, false);
+        assert_eq!(caps & CLIENT_DEPRECATE_EOF, 0);
+
+        // The bits the proxy always needs are added regardless.
+        assert_ne!(caps & CLIENT_PROTOCOL_41, 0);
+        assert_ne!(caps & CLIENT_SECURE_CONNECTION, 0);
+        assert_ne!(caps & CLIENT_PLUGIN_AUTH, 0);
+    }
+
+    #[test]
+    fn test_upstream_capabilities_never_exceed_what_the_server_offers() {
+        use crate::protocol::mysql::CLIENT_DEPRECATE_EOF;
+
+        // Client wants DEPRECATE_EOF, server does not support it.
+        let caps = negotiate_upstream_capabilities(u32::MAX, !CLIENT_DEPRECATE_EOF, false, false);
+        assert_eq!(caps & CLIENT_DEPRECATE_EOF, 0);
+    }
+
+    #[test]
+    fn test_upstream_capabilities_are_owned_by_the_proxy() {
+        use crate::protocol::mysql::{
+            CLIENT_COMPRESS, CLIENT_CONNECT_ATTRS, CLIENT_CONNECT_WITH_DB, CLIENT_SSL,
+        };
+
+        // Even if the client negotiated all of these, the proxy decides.
+        let caps = negotiate_upstream_capabilities(u32::MAX, u32::MAX, false, false);
+        assert_eq!(
+            caps & CLIENT_COMPRESS,
+            0,
+            "compression would stop the codec framing packets, silently bypassing masking"
+        );
+        assert_eq!(caps & CLIENT_SSL, 0);
+        assert_eq!(caps & CLIENT_CONNECT_WITH_DB, 0);
+        assert_eq!(
+            caps & CLIENT_CONNECT_ATTRS,
+            0,
+            "the re-encoded response carries no attribute block"
+        );
+
+        // ...and are set when the proxy does need them.
+        let caps = negotiate_upstream_capabilities(0, u32::MAX, true, true);
+        assert_ne!(caps & CLIENT_CONNECT_WITH_DB, 0);
+        assert_ne!(caps & CLIENT_SSL, 0);
+        assert_eq!(caps & CLIENT_COMPRESS, 0);
     }
 
     #[test]

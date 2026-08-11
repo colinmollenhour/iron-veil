@@ -46,6 +46,7 @@ QUERY_OUTPUT=""
 # The suite does not depend on the shipped proxy.yaml (its demo rules change
 # independently); it generates its own config below.
 E2E_CONFIG=""
+TERMINATE_CONFIG=""
 
 #######################################
 # Helper Functions
@@ -279,9 +280,12 @@ cleanup() {
     docker rm -f pg-test mysql-test 2>/dev/null || true
     log_info "Removed test containers"
 
-    # Remove generated config
+    # Remove generated configs
     if [ -n "$E2E_CONFIG" ]; then
         rm -f "$E2E_CONFIG"
+    fi
+    if [ -n "$TERMINATE_CONFIG" ]; then
+        rm -f "$TERMINATE_CONFIG"
     fi
 }
 trap cleanup EXIT
@@ -635,6 +639,147 @@ INSERT INTO orders (buyer_email, card_number, status) VALUES
 EOF
 
     log_success "MySQL seeded with test data"
+}
+
+#######################################
+# MySQL Terminating Authentication (B-3)
+#######################################
+
+# Config for auth.mode: terminate. The proxy holds the real upstream
+# credential (root/password) and authenticates clients against a throwaway
+# local one, so the client credential is good for nothing but this hop.
+write_terminate_config() {
+    TERMINATE_CONFIG="$(mktemp -t ironveil-e2e-terminate.XXXXXX)"
+    cat > "$TERMINATE_CONFIG" <<'EOF'
+masking_enabled: true
+upstream_tls: false
+auth:
+  mode: terminate
+  client_username: door
+  client_password: door-throwaway
+  upstream_username: root
+  upstream_password: password
+  upstream_database: testdb
+rules:
+  - table: users
+    column: email
+    strategy: email
+  - table: users
+    column: phone_number
+    strategy: phone
+heuristics:
+  enabled: true
+  types: ["email", "phone", "ssn", "credit_card"]
+EOF
+    log_info "Generated terminate-mode config: $TERMINATE_CONFIG"
+}
+
+# Run a query as the throwaway client credential rather than the DB one.
+run_query_mysql_as() {
+    local user="$1" password="$2" sql="$3"
+    QUERY_OK=false
+    QUERY_OUTPUT=""
+    local err
+    err=$(mktemp -t ironveil-mysql-err.XXXXXX)
+    if QUERY_OUTPUT=$(docker run --rm "$MYSQL_IMAGE" \
+        mysql -h "$DOCKER_HOST_ADDR" -P "$PROXY_PORT" -u"$user" -p"$password" testdb \
+        --skip-column-names -e "$sql" 2>"$err"); then
+        QUERY_OK=true
+    else
+        QUERY_OUTPUT=$(cat "$err")
+    fi
+    rm -f "$err"
+}
+
+run_mysql_terminate_auth_tests() {
+    log_header "MySQL Terminating Authentication"
+
+    if ! docker ps | grep -q mysql-test; then
+        setup_mysql || return 1
+    fi
+    write_terminate_config
+
+    log_section "Starting IronVeil proxy (MySQL, auth.mode: terminate)..."
+    ./target/release/iron-veil --config "$TERMINATE_CONFIG" \
+        --port "$PROXY_PORT" --upstream-host localhost --upstream-port "$MYSQL_PORT" \
+        --api-port "$API_PORT" --protocol mysql &
+    PROXY_PID=$!
+
+    if ! wait_for_port "$PROXY_PORT" "IronVeil Proxy"; then
+        log_error "Failed to start proxy in terminate mode"
+        return 1
+    fi
+    sleep 2
+
+    # 1. The throwaway local credential gets in. This exercises the whole
+    #    path: the proxy serves its own caching_sha2_password handshake and
+    #    verifies fast auth from the configured cleartext password, then
+    #    authenticates upstream itself as root over mysql_native_password.
+    log_section "Test: Local Credential Authenticates"
+    run_query_mysql_as door door-throwaway "SELECT 1;"
+    if [ "$QUERY_OK" = true ]; then
+        log_success "Terminate: throwaway client credential authenticated"
+    else
+        log_error "Terminate: client credential rejected: $QUERY_OUTPUT"
+    fi
+
+    # 2. The real upstream credential must NOT work against the proxy. This is
+    #    the whole point of the mode: the exposed port no longer accepts the
+    #    database password, so a compromised client cannot replay it upstream.
+    log_section "Test: Upstream Credential Is Not Accepted By The Proxy"
+    run_query_mysql_as root password "SELECT 1;"
+    if [ "$QUERY_OK" = true ]; then
+        log_error "Terminate: upstream DB credential was accepted by the proxy"
+    else
+        log_success "Terminate: upstream DB credential rejected at the proxy"
+    fi
+
+    # 3. A wrong password for the right user is denied.
+    log_section "Test: Wrong Password Is Denied"
+    run_query_mysql_as door not-the-password "SELECT 1;"
+    if [ "$QUERY_OK" = true ]; then
+        log_error "Terminate: wrong password was accepted"
+    else
+        if printf '%s' "$QUERY_OUTPUT" | grep -qi "access denied"; then
+            log_success "Terminate: wrong password denied with ER_ACCESS_DENIED"
+        else
+            log_error "Terminate: wrong password rejected, but not cleanly: $QUERY_OUTPUT"
+        fi
+    fi
+
+    # 4. Masking must behave identically to passthrough mode — terminating auth
+    #    changes who authenticates, not what the result set looks like.
+    log_section "Test: Masking Still Applies In Terminate Mode"
+    run_query_mysql_as door door-throwaway "SELECT email, phone_number FROM users;"
+    assert_masked 1 "mysql.user@test.com" "Terminate: email masked"
+    assert_masked 1 "555-111-2222" "Terminate: phone masked"
+
+    run_query_mysql_as door door-throwaway "SELECT buyer_email, card_number FROM orders;"
+    assert_masked 1 "buyer@shop.com" "Terminate: heuristic email masked"
+    assert_masked 1 "4111-1111-1111-1111" "Terminate: heuristic credit card masked"
+
+    # 5. Multi-row result sets exercise the terminator handling under the
+    #    capability flags the proxy negotiated on the client's behalf.
+    log_section "Test: Result Set Shape Survives Negotiated Capabilities"
+    run_query_mysql_as door door-throwaway \
+        "SELECT id FROM users UNION ALL SELECT id FROM orders UNION ALL SELECT 99;"
+    if [ "$QUERY_OK" = true ]; then
+        local rows
+        rows=$(printf '%s\n' "$QUERY_OUTPUT" | sed -e '/^[[:space:]]*$/d' | wc -l)
+        if [ "$rows" -eq 3 ]; then
+            log_success "Terminate: multi-row result set intact ($rows rows)"
+        else
+            log_error "Terminate: expected 3 rows, got $rows: $QUERY_OUTPUT"
+        fi
+    else
+        log_error "Terminate: multi-row query failed: $QUERY_OUTPUT"
+    fi
+
+    kill "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=""
+    rm -f "$TERMINATE_CONFIG"
+    TERMINATE_CONFIG=""
+    sleep 1
 }
 
 run_mysql_tests() {
@@ -1062,10 +1207,12 @@ main() {
             ;;
         mysql)
             run_mysql_tests
+            run_mysql_terminate_auth_tests
             ;;
         all)
             run_postgres_tests
             run_mysql_tests
+            run_mysql_terminate_auth_tests
             run_api_tests
             run_negative_tests
             run_connection_tests

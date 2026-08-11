@@ -33,6 +33,37 @@ tls:
   cert_path: certs/server.crt
   key_path: certs/server.key
 upstream_tls: false
+
+# MySQL authentication handling.
+#
+#   passthrough (default) — credential-transparent. The client's own MySQL
+#     credentials cross the proxy untouched, so whatever process is exposed to
+#     clients necessarily handles the real database password.
+#
+#   terminate — the proxy holds the upstream credential itself and
+#     authenticates its clients against a separate local one. In the sidecar
+#     shape the local credential is a throwaway that only ever crosses
+#     loopback, so the exposed door process never sees the real DB password.
+#
+# Every secret can be given inline, read from a file (Kubernetes/Docker secret
+# mounts), or supplied via the environment. Precedence per secret is
+# environment > file > inline.
+#
+# Note: with a caching_sha2_password account upstream, MySQL demands full
+# authentication until it has the credential cached, and full auth sends the
+# password in cleartext — so set upstream_tls: true for that path. The client
+# leg never needs full auth: the proxy holds the cleartext password and can
+# satisfy fast auth on the very first connection.
+# auth:
+#   mode: terminate
+#   client_username: door                    # env: IRONVEIL_CLIENT_USERNAME
+#   client_password: local-throwaway         # env: IRONVEIL_CLIENT_PASSWORD
+#   # client_password_file: /run/secrets/ironveil-client-password
+#   client_auth_plugin: caching_sha2_password  # or mysql_native_password
+#   upstream_username: support_ro            # env: IRONVEIL_UPSTREAM_USERNAME
+#   # upstream_password: ...                 # env: IRONVEIL_UPSTREAM_PASSWORD
+#   upstream_password_file: /run/secrets/ironveil-upstream-password
+#   upstream_database: wms
 telemetry:
   enabled: false
   otlp_endpoint: http://localhost:4317
