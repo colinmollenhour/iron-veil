@@ -51,6 +51,7 @@ QUERY_OUTPUT=""
 # independently); it generates its own config below.
 E2E_CONFIG=""
 TERMINATE_CONFIG=""
+RSA_E2E_DIR=""
 
 #######################################
 # Helper Functions
