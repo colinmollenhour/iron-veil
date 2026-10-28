@@ -20,6 +20,7 @@ NC='\033[0m' # No Color
 # Configuration
 PG_PORT=5433
 MYSQL_PORT=3307
+MYSQL9_PORT=3309
 PROXY_PORT=6543
 API_PORT=3001
 GRACEFUL_TEST_PORT=6599
@@ -28,12 +29,15 @@ PROXY_PID=""
 TEST_PROTOCOL="${1:-postgres}"  # Default to postgres, can pass 'mysql' or 'all'
 
 # Container images (postgres tag kept in sync with docker-compose.yml).
-# Pin MySQL to 8.0: 8.4 defaults to caching_sha2_password, which needs either
-# TLS or an RSA public-key exchange the cleartext proxy path does not yet
-# handle cleanly (auth packets get misread as column definitions). 8.0 still
-# supports mysql_native_password for non-TLS e2e.
+# The passthrough suites pin MySQL to 8.0: 8.4 defaults to caching_sha2_password,
+# whose full auth needs either TLS or an RSA public-key exchange that the
+# *passthrough* path does not handle (auth packets get misread as column
+# definitions). 8.0 still supports mysql_native_password for non-TLS e2e.
+# Terminate mode does handle it: run_mysql_caching_sha2_rsa_tests covers full
+# auth over RSA against MySQL 9.7, which has no mysql_native_password at all.
 POSTGRES_IMAGE="postgres:17"
 MYSQL_IMAGE="mysql:8.0"
+MYSQL9_IMAGE="mysql:9.7"
 
 # Counters
 TESTS_PASSED=0
@@ -47,6 +51,7 @@ QUERY_OUTPUT=""
 # independently); it generates its own config below.
 E2E_CONFIG=""
 TERMINATE_CONFIG=""
+RSA_E2E_DIR=""
 
 #######################################
 # Helper Functions
@@ -315,7 +320,7 @@ cleanup() {
     fi
 
     # Stop containers
-    docker rm -f pg-test mysql-test 2>/dev/null || true
+    docker rm -f pg-test mysql-test mysql9-test 2>/dev/null || true
     log_info "Removed test containers"
 
     # Remove generated configs
@@ -324,6 +329,9 @@ cleanup() {
     fi
     if [ -n "$TERMINATE_CONFIG" ]; then
         rm -f "$TERMINATE_CONFIG"
+    fi
+    if [ -n "$RSA_E2E_DIR" ]; then
+        rm -rf "$RSA_E2E_DIR"
     fi
 }
 trap cleanup EXIT
@@ -479,7 +487,7 @@ check_ports() {
     fi
 
     if [ "$TEST_PROTOCOL" = "mysql" ] || [ "$TEST_PROTOCOL" = "all" ]; then
-        ports+=("$MYSQL_PORT")
+        ports+=("$MYSQL_PORT" "$MYSQL9_PORT")
     fi
 
     for port in "${ports[@]}"; do
@@ -761,6 +769,163 @@ run_query_mysql_as() {
         QUERY_OUTPUT=$(cat "$err")
     fi
     rm -f "$err"
+}
+
+#######################################
+# MySQL 9.7: caching_sha2_password full auth over RSA (terminate mode)
+#######################################
+
+# The account's server-side cache is empty on its first login and after every
+# restart, FLUSH PRIVILEGES or ALTER USER; that forces full authentication. With
+# upstream_tls off, the proxy must answer it with the password RSA-encrypted
+# under the server's pinned public key, and must fail closed without the right one.
+
+write_rsa_terminate_config() {
+    local key_line="$1"
+    RSA_CONFIG="$RSA_E2E_DIR/config.yaml"
+    cat > "$RSA_CONFIG" <<EOF
+masking_enabled: true
+upstream_tls: false
+auth:
+  mode: terminate
+  client_username: door
+  client_password: door-throwaway
+  upstream_username: support_ro
+  upstream_password: sha2-secret
+  upstream_database: testdb
+$key_line
+rules: []
+EOF
+}
+
+start_rsa_proxy() {
+    RSA_PROXY_LOG="$RSA_E2E_DIR/proxy.log"
+    ./target/release/iron-veil --config "$RSA_CONFIG" \
+        --port "$PROXY_PORT" --upstream-host 127.0.0.1 --upstream-port "$MYSQL9_PORT" \
+        --api-port "$API_PORT" --protocol mysql > "$RSA_PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+    wait_for_port "$PROXY_PORT" "IronVeil Proxy (RSA)" || return 1
+    sleep 1
+}
+
+stop_rsa_proxy() {
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=""
+    sleep 1
+}
+
+flush_mysql9_auth_cache() {
+    docker exec mysql9-test mysql -h 127.0.0.1 -uroot -ppassword -e "FLUSH PRIVILEGES" 2>/dev/null
+}
+
+run_mysql_caching_sha2_rsa_tests() {
+    log_header "MySQL 9.7: caching_sha2_password full auth over RSA"
+
+    RSA_E2E_DIR="$(mktemp -d -t ironveil-e2e-rsa.XXXXXX)"
+    docker rm -f mysql9-test 2>/dev/null || true
+    docker run --name mysql9-test \
+        -e MYSQL_ROOT_PASSWORD=password \
+        -e MYSQL_DATABASE=testdb \
+        -p "$MYSQL9_PORT:3306" \
+        -d "$MYSQL9_IMAGE" > /dev/null
+    wait_for_port "$MYSQL9_PORT" "MySQL 9.7" || return 1
+    wait_for_db_ready mysql9-test "MySQL 9.7" \
+        mysql -h 127.0.0.1 -uroot -ppassword -e "SELECT 1" || return 1
+
+    if ! docker exec -i mysql9-test mysql -h 127.0.0.1 -uroot -ppassword testdb <<'SQL'
+CREATE USER 'support_ro'@'%' IDENTIFIED WITH caching_sha2_password BY 'sha2-secret';
+GRANT SELECT ON testdb.* TO 'support_ro'@'%';
+CREATE TABLE probe (id INT PRIMARY KEY, label VARCHAR(20));
+INSERT INTO probe VALUES (1, 'reached');
+SQL
+    then
+        log_error "RSA: failed to seed MySQL 9.7"
+        return 1
+    fi
+
+    # Pin the server's own key, as an operator would from
+    # SHOW STATUS LIKE 'Caching_sha2_password_rsa_public_key'.
+    docker exec mysql9-test mysql -h 127.0.0.1 -uroot -ppassword -N -B --raw \
+        -e "SHOW STATUS LIKE 'Caching_sha2_password_rsa_public_key'" 2>/dev/null \
+        | cut -f2- > "$RSA_E2E_DIR/server.pem"
+    if ! grep -q "BEGIN PUBLIC KEY" "$RSA_E2E_DIR/server.pem"; then
+        log_error "RSA: could not read the server's RSA public key"
+        return 1
+    fi
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 2>/dev/null \
+        | openssl pkey -pubout > "$RSA_E2E_DIR/wrong.pem"
+
+    local plugin
+    plugin=$(docker exec mysql9-test mysql -h 127.0.0.1 -uroot -ppassword -N -B \
+        -e "SELECT plugin FROM mysql.user WHERE user='support_ro'" 2>/dev/null)
+    if [ "$plugin" = "caching_sha2_password" ]; then
+        log_success "RSA: support_ro uses caching_sha2_password"
+    else
+        log_error "RSA: support_ro plugin is '$plugin'"
+    fi
+
+    # 1. Pinned key, cold cache: the RSA path authenticates.
+    write_rsa_terminate_config "  upstream_rsa_public_key_file: $RSA_E2E_DIR/server.pem"
+    start_rsa_proxy || return 1
+    log_section "Test: Uncached Login Over RSA"
+    flush_mysql9_auth_cache
+    run_query_mysql_as door door-throwaway "SELECT label FROM probe;"
+    if [ "$QUERY_OK" = true ] && printf '%s' "$QUERY_OUTPUT" | grep -q "reached"; then
+        log_success "RSA: uncached caching_sha2 login succeeded through the proxy"
+    else
+        log_error "RSA: uncached login failed: $QUERY_OUTPUT $(tail -3 "$RSA_PROXY_LOG")"
+    fi
+
+    # 2. Now cached: fast auth.
+    run_query_mysql_as door door-throwaway "SELECT label FROM probe;"
+    if [ "$QUERY_OK" = true ]; then
+        log_success "RSA: cached (fast-auth) login succeeded"
+    else
+        log_error "RSA: cached login failed: $QUERY_OUTPUT"
+    fi
+
+    # 3. The cache empties again (as after a server restart): still works.
+    flush_mysql9_auth_cache
+    run_query_mysql_as door door-throwaway "SELECT label FROM probe;"
+    if [ "$QUERY_OK" = true ]; then
+        log_success "RSA: login after a second cache flush succeeded"
+    else
+        log_error "RSA: login after re-flush failed: $QUERY_OUTPUT"
+    fi
+    stop_rsa_proxy
+
+    # 4. A substituted key fails closed, and the proxy says why.
+    write_rsa_terminate_config "  upstream_rsa_public_key_file: $RSA_E2E_DIR/wrong.pem"
+    start_rsa_proxy || return 1
+    log_section "Test: Wrong Pinned Key Fails Closed"
+    flush_mysql9_auth_cache
+    run_query_mysql_as door door-throwaway "SELECT label FROM probe;"
+    if [ "$QUERY_OK" = true ]; then
+        log_error "RSA: login succeeded with the wrong pinned key"
+    elif grep -q "re-pin auth.upstream_rsa_public_key" "$RSA_PROXY_LOG"; then
+        log_success "RSA: wrong pinned key rejected, with the re-pin hint"
+    else
+        log_error "RSA: wrong key rejected without the hint: $(tail -3 "$RSA_PROXY_LOG")"
+    fi
+    stop_rsa_proxy
+
+    # 5. No key and no TLS: never sends the password, fails closed.
+    write_rsa_terminate_config ""
+    start_rsa_proxy || return 1
+    log_section "Test: No Pinned Key Fails Closed"
+    flush_mysql9_auth_cache
+    run_query_mysql_as door door-throwaway "SELECT label FROM probe;"
+    if [ "$QUERY_OK" = true ]; then
+        log_error "RSA: login succeeded with no key and no TLS"
+    elif grep -q "no RSA key is pinned" "$RSA_PROXY_LOG"; then
+        log_success "RSA: no key and no TLS refused before sending the password"
+    else
+        log_error "RSA: refused for the wrong reason: $(tail -3 "$RSA_PROXY_LOG")"
+    fi
+    stop_rsa_proxy
+
+    docker rm -f mysql9-test > /dev/null 2>&1 || true
 }
 
 run_mysql_terminate_auth_tests() {
@@ -1339,11 +1504,13 @@ main() {
         mysql)
             run_mysql_tests
             run_mysql_terminate_auth_tests
+            run_mysql_caching_sha2_rsa_tests
             ;;
         all)
             run_postgres_tests
             run_mysql_tests
             run_mysql_terminate_auth_tests
+            run_mysql_caching_sha2_rsa_tests
             run_api_tests
             run_negative_tests
             run_connection_tests

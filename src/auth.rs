@@ -25,9 +25,15 @@
 //! RSA key pair, and works with or without client TLS.
 //!
 //! The upstream leg is an ordinary MySQL client and does hit full auth when the
-//! server has not cached the credential; there the password goes out as
-//! cleartext, which MySQL only permits over a secure channel — hence the
-//! requirement that `upstream_tls` be on for that path.
+//! server has not cached the credential — on the account's first login and
+//! after every server restart, `FLUSH PRIVILEGES` or `ALTER USER`. With
+//! `upstream_tls` on, the password goes out as cleartext over TLS. Without it,
+//! iron-veil uses the protocol's RSA path instead: the password, XORed with the
+//! connection's nonce, encrypted with RSA-OAEP under the server's public key.
+//! That key is pinned in config (`auth.upstream_rsa_public_key[_file]`), the way
+//! the mysql client's `--server-public-key-path` works, and is never fetched
+//! from the server: a key accepted from the wire would let anyone in the path
+//! substitute their own and decrypt the password.
 
 use anyhow::Result;
 use sha1::Sha1;
@@ -236,12 +242,86 @@ pub fn build_fast_auth_success() -> Vec<u8> {
 
 /// The reply to a full-auth request on a secure channel: the password as a
 /// NUL-terminated cleartext string. MySQL rejects this on an insecure
-/// connection, which is why the upstream leg requires TLS to reach it.
+/// connection; there, use [`build_rsa_encrypted_password`].
 pub fn build_cleartext_password(password: &str) -> Vec<u8> {
     let mut payload = Vec::with_capacity(password.len() + 1);
     payload.extend_from_slice(password.as_bytes());
     payload.push(0);
     payload
+}
+
+/// The OAEP parameters MySQL's `caching_sha2_password` uses for its RSA path
+/// (OpenSSL's `RSA_PKCS1_OAEP_PADDING`: SHA-1 with MGF1-SHA-1), servers 8.0.5+.
+static MYSQL_RSA_OAEP: &aws_lc_rs::rsa::OaepAlgorithm = &aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1;
+
+/// The upstream server's pinned RSA public key, validated, kept as its DER
+/// bytes. (aws-lc-rs key objects are neither `Send` nor `Sync`, so the key is
+/// rebuilt from these bytes for each — rare — full-auth login.)
+#[derive(Debug, Clone)]
+pub struct PinnedRsaKey {
+    der: Vec<u8>,
+}
+
+impl PinnedRsaKey {
+    fn oaep_key(&self) -> Result<aws_lc_rs::rsa::OaepPublicEncryptingKey> {
+        oaep_key_from_der(&self.der)
+    }
+}
+
+fn oaep_key_from_der(der: &[u8]) -> Result<aws_lc_rs::rsa::OaepPublicEncryptingKey> {
+    let key = aws_lc_rs::rsa::PublicEncryptingKey::from_der(der)
+        .map_err(|e| anyhow::anyhow!("not a usable RSA public key (2048-8192 bits): {e}"))?;
+    aws_lc_rs::rsa::OaepPublicEncryptingKey::new(key)
+        .map_err(|_| anyhow::anyhow!("could not build an RSA-OAEP key"))
+}
+
+/// Parse the upstream server's pinned RSA public key: PEM `-----BEGIN PUBLIC
+/// KEY-----` (SubjectPublicKeyInfo), the form MySQL publishes in its
+/// `public_key.pem` and in `SHOW STATUS LIKE
+/// 'Caching_sha2_password_rsa_public_key'`.
+pub fn parse_rsa_public_key(pem: &str) -> Result<PinnedRsaKey> {
+    let der = rustls_pemfile::public_keys(&mut pem.as_bytes())
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no '-----BEGIN PUBLIC KEY-----' block found (PKCS#1 'BEGIN RSA PUBLIC KEY' is                  not supported; use the key from SHOW STATUS LIKE                  'Caching_sha2_password_rsa_public_key')"
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("invalid PEM: {e}"))?;
+    oaep_key_from_der(der.as_ref())?;
+    Ok(PinnedRsaKey {
+        der: der.as_ref().to_vec(),
+    })
+}
+
+/// The reply to a full-auth request on an insecure channel: the NUL-terminated
+/// password XORed with the connection's nonce (repeated as needed), encrypted
+/// with RSA-OAEP under the server's public key. The XOR binds the ciphertext to
+/// this connection, so a captured reply can't be replayed on another.
+pub fn build_rsa_encrypted_password(
+    pinned: &PinnedRsaKey,
+    password: &str,
+    nonce: &[u8],
+) -> Result<Vec<u8>> {
+    let key = pinned.oaep_key()?;
+    if nonce.is_empty() {
+        anyhow::bail!("the server sent an empty auth nonce");
+    }
+    let mut plaintext = build_cleartext_password(password);
+    for (i, byte) in plaintext.iter_mut().enumerate() {
+        *byte ^= nonce[i % nonce.len()];
+    }
+    if plaintext.len() > key.max_plaintext_size(MYSQL_RSA_OAEP) {
+        plaintext.fill(0);
+        anyhow::bail!("the upstream password is too long for the server's RSA key");
+    }
+    let mut ciphertext = vec![0u8; key.ciphertext_size()];
+    let result = key
+        .encrypt(MYSQL_RSA_OAEP, &plaintext, &mut ciphertext, None)
+        .map(|written| written.to_vec())
+        .map_err(|_| anyhow::anyhow!("RSA encryption of the upstream password failed"));
+    plaintext.fill(0);
+    result
 }
 
 /// What an AuthMoreData packet from the server is asking for.
@@ -275,6 +355,86 @@ mod tests {
     use super::*;
 
     const NONCE: &[u8] = b"abcdefghijklmnopqrst";
+
+    /// A fresh RSA key pair and its public half as MySQL would publish it.
+    fn rsa_pair() -> (aws_lc_rs::rsa::PrivateDecryptingKey, String) {
+        use aws_lc_rs::encoding::AsDer;
+        use base64::Engine;
+        let private =
+            aws_lc_rs::rsa::PrivateDecryptingKey::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+                .unwrap();
+        let der = private.public_key().as_der().unwrap();
+        let body = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let pem = format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            lines.join("\n")
+        );
+        (private, pem)
+    }
+
+    /// What the server does with the reply: decrypt, then undo the nonce XOR.
+    fn server_side_decrypt(
+        private: aws_lc_rs::rsa::PrivateDecryptingKey,
+        ciphertext: &[u8],
+        nonce: &[u8],
+    ) -> Vec<u8> {
+        let key = aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(private).unwrap();
+        let mut out = vec![0u8; key.min_output_size()];
+        let plain = key
+            .decrypt(MYSQL_RSA_OAEP, ciphertext, &mut out, None)
+            .unwrap()
+            .to_vec();
+        plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ nonce[i % nonce.len()])
+            .collect()
+    }
+
+    #[test]
+    fn test_rsa_password_round_trips_through_the_servers_private_key() {
+        let (private, pem) = rsa_pair();
+        let key = parse_rsa_public_key(&pem).unwrap();
+        // Longer than the nonce, so the XOR has to wrap around.
+        let password = "correct horse battery staple, 33!";
+        let ciphertext = build_rsa_encrypted_password(&key, password, NONCE).unwrap();
+        assert_eq!(ciphertext.len(), 256);
+        assert_eq!(
+            server_side_decrypt(private, &ciphertext, NONCE),
+            build_cleartext_password(password)
+        );
+    }
+
+    #[test]
+    fn test_rsa_ciphertext_is_randomised() {
+        let (_private, pem) = rsa_pair();
+        let key = parse_rsa_public_key(&pem).unwrap();
+        let a = build_rsa_encrypted_password(&key, "pw", NONCE).unwrap();
+        let b = build_rsa_encrypted_password(&key, "pw", NONCE).unwrap();
+        assert_ne!(a, b, "OAEP padding must make each encryption distinct");
+    }
+
+    #[test]
+    fn test_rsa_rejects_unusable_keys_and_nonces() {
+        assert!(parse_rsa_public_key("not a key").is_err());
+        let pkcs1 =
+            "-----BEGIN RSA PUBLIC KEY-----\nMAoCAwEAAQIDAQAB\n-----END RSA PUBLIC KEY-----\n";
+        let err = parse_rsa_public_key(pkcs1).unwrap_err().to_string();
+        assert!(err.contains("BEGIN PUBLIC KEY"), "got: {err}");
+        let (_private, pem) = rsa_pair();
+        let key = parse_rsa_public_key(&pem).unwrap();
+        assert!(build_rsa_encrypted_password(&key, "pw", b"").is_err());
+        let too_long = "x".repeat(300);
+        let err = build_rsa_encrypted_password(&key, &too_long, NONCE)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too long"), "got: {err}");
+    }
 
     #[test]
     fn test_caching_sha2_roundtrip() {
