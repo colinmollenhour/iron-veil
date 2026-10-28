@@ -309,6 +309,16 @@ pub struct AuthConfig {
     /// Default schema to select upstream when the client does not name one.
     #[serde(default)]
     pub upstream_database: Option<String>,
+    /// The upstream server's RSA public key (PEM, `-----BEGIN PUBLIC KEY-----`),
+    /// pinned for `caching_sha2_password` full authentication when
+    /// `upstream_tls` is off. Read it from the server with `SHOW STATUS LIKE
+    /// 'Caching_sha2_password_rsa_public_key'`. Never fetched from the wire.
+    /// Env: IRONVEIL_UPSTREAM_RSA_PUBLIC_KEY (the PEM text).
+    #[serde(default)]
+    pub upstream_rsa_public_key: Option<String>,
+    /// File to read the pinned upstream RSA public key from.
+    #[serde(default)]
+    pub upstream_rsa_public_key_file: Option<String>,
 }
 
 /// Auth settings with every secret resolved, built once at startup.
@@ -324,6 +334,8 @@ pub struct ResolvedAuth {
     pub upstream_username: String,
     pub upstream_password: String,
     pub upstream_database: Option<String>,
+    /// PEM of the pinned upstream RSA public key, when configured.
+    pub upstream_rsa_public_key: Option<String>,
 }
 
 /// Resolve one secret from environment > file > inline.
@@ -414,6 +426,14 @@ impl AuthConfig {
             );
         }
 
+        let upstream_rsa_public_key = resolve_secret(
+            env("IRONVEIL_UPSTREAM_RSA_PUBLIC_KEY"),
+            self.upstream_rsa_public_key_file.as_deref(),
+            self.upstream_rsa_public_key.as_deref(),
+            "auth.upstream_rsa_public_key",
+        )?
+        .filter(|pem| !pem.trim().is_empty());
+
         Ok(Some(ResolvedAuth {
             client_username,
             client_password,
@@ -421,6 +441,7 @@ impl AuthConfig {
             upstream_username,
             upstream_password,
             upstream_database: self.upstream_database.clone(),
+            upstream_rsa_public_key,
         }))
     }
 
@@ -935,6 +956,66 @@ mod tests {
 
         let err = config.resolve_with(no_env).unwrap_err();
         assert!(err.to_string().contains("failed to read"), "got: {err}");
+    }
+
+    #[test]
+    fn test_upstream_rsa_public_key_resolves_env_file_inline() {
+        // Unset by default: full auth without TLS then fails closed.
+        assert!(
+            terminate_config()
+                .resolve_with(no_env)
+                .unwrap()
+                .unwrap()
+                .upstream_rsa_public_key
+                .is_none()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server_public_key.pem");
+        std::fs::write(&path, "FROM-FILE\n").unwrap();
+        let mut config = terminate_config();
+        config.upstream_rsa_public_key = Some("INLINE".to_string());
+        config.upstream_rsa_public_key_file = Some(path.to_string_lossy().into_owned());
+
+        let from_file = config.resolve_with(no_env).unwrap().unwrap();
+        assert_eq!(
+            from_file.upstream_rsa_public_key.as_deref(),
+            Some("FROM-FILE")
+        );
+
+        let from_env = config
+            .resolve_with(|name| {
+                (name == "IRONVEIL_UPSTREAM_RSA_PUBLIC_KEY").then(|| "FROM-ENV".to_string())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            from_env.upstream_rsa_public_key.as_deref(),
+            Some("FROM-ENV")
+        );
+
+        config.upstream_rsa_public_key_file = None;
+        config.upstream_rsa_public_key = Some("   ".to_string());
+        assert!(
+            config
+                .resolve_with(no_env)
+                .unwrap()
+                .unwrap()
+                .upstream_rsa_public_key
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_upstream_rsa_public_key_parses_from_yaml() {
+        let config: AuthConfig = serde_yaml_ng::from_str(
+            "mode: terminate\nupstream_rsa_public_key_file: /run/secrets/mysql_rsa.pem\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.upstream_rsa_public_key_file.as_deref(),
+            Some("/run/secrets/mysql_rsa.pem")
+        );
     }
 
     #[test]

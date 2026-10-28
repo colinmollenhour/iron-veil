@@ -164,6 +164,7 @@ supply the value without it appearing in the config:
 | Client password | `IRONVEIL_CLIENT_PASSWORD` | `auth.client_password` / `auth.client_password_file` |
 | Upstream username | `IRONVEIL_UPSTREAM_USERNAME` | `auth.upstream_username` |
 | Upstream password | `IRONVEIL_UPSTREAM_PASSWORD` | `auth.upstream_password` / `auth.upstream_password_file` |
+| Pinned upstream RSA public key (PEM) | `IRONVEIL_UPSTREAM_RSA_PUBLIC_KEY` | `auth.upstream_rsa_public_key` / `auth.upstream_rsa_public_key_file` |
 
 ### Recommended Settings For A Localhost Sidecar
 
@@ -179,7 +180,9 @@ api:
   enabled: false      # no HTTP control plane at all
 auth:
   mode: terminate     # the exposed process never holds the DB credential
-upstream_tls: true    # required for a non-cached caching_sha2_password account
+  # A non-cached caching_sha2_password account needs ONE of:
+  upstream_rsa_public_key_file: /run/secrets/mysql-rsa-public-key.pem
+# upstream_tls: true  # ...or TLS to the database
 ```
 
 The management API is worth turning off rather than merely binding to
@@ -244,6 +247,7 @@ auth:
   # upstream_username: support_ro
   # upstream_password_file: /run/secrets/ironveil-upstream-password
   # upstream_database: wms
+  # upstream_rsa_public_key_file: /run/secrets/mysql-rsa-public-key.pem
 
 # OpenTelemetry (send traces to Jaeger, Grafana Tempo, etc.)
 telemetry:
@@ -406,11 +410,25 @@ Notes:
   client TLS. A client that offers a different plugin is sent a standard
   `AuthSwitchRequest`.
 - **The upstream leg may.** If the upstream account uses
-  `caching_sha2_password` and the server has not cached the proxy's credential,
-  MySQL demands full authentication, which transmits the password in cleartext.
-  Set `upstream_tls: true` for that path. iron-veil refuses to send the
-  password on an insecure connection and says so rather than failing obscurely.
-  `mysql_native_password` accounts need no full auth and work either way.
+  `caching_sha2_password` and the server has not cached the proxy's credential
+  — its first login, and after every server restart, `FLUSH PRIVILEGES` or
+  `ALTER USER` — MySQL demands full authentication. There are two ways to
+  answer it:
+  - `upstream_tls: true`: the password goes as cleartext over TLS.
+  - A **pinned RSA public key** (`auth.upstream_rsa_public_key_file`): without
+    TLS, the password is XORed with the connection's nonce and RSA-OAEP
+    encrypted under the server's key, the protocol's standard non-TLS path.
+    Get the key from the server with
+    `SHOW STATUS LIKE 'Caching_sha2_password_rsa_public_key'` (or its
+    `public_key.pem`). iron-veil never fetches the key over the wire, because
+    a key taken from the connection would let anything in the path substitute
+    its own and read the password. A wrong pin fails closed with a hint to
+    re-pin; the key is validated at startup.
+
+  With neither, iron-veil refuses to send the password and says so rather than
+  failing obscurely. `mysql_native_password` accounts need no full auth, but
+  MySQL 9 no longer has that plugin. Passthrough mode still can't relay the
+  RSA exchange; use terminate mode for `caching_sha2_password` without TLS.
 - Supported plugins are `caching_sha2_password` (default, recommended) and
   `mysql_native_password` on both legs. `client_auth_plugin` sets what is
   offered to clients; the upstream plugin follows whatever the server asks for.

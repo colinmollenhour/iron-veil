@@ -715,14 +715,15 @@ async fn main() -> Result<()> {
                 "Terminating MySQL authentication at the proxy; \
                  clients never see the upstream credential"
             );
-            if !config.upstream_tls {
+            if !config.upstream_tls && resolved.upstream_rsa_public_key.is_none() {
                 // Not fatal: the credential may already be cached upstream, or
                 // the account may use mysql_native_password. But full auth will
                 // fail, and that failure is confusing without this warning.
                 warn!(
-                    "auth.mode is 'terminate' but upstream_tls is false: the proxy's own \
-                     credential can only authenticate if the upstream has it cached or the \
-                     account uses mysql_native_password"
+                    "auth.mode is 'terminate', upstream_tls is false and no upstream RSA key \
+                     is pinned: the proxy's own credential can only authenticate while the \
+                     upstream has it cached, or if the account uses mysql_native_password; \
+                     set auth.upstream_rsa_public_key_file or upstream_tls: true"
                 );
             }
             Some(Arc::new(TerminatingAuth::from_resolved(&resolved)?))
@@ -1649,6 +1650,8 @@ struct TerminatingAuth {
     upstream_username: String,
     upstream_password: String,
     upstream_database: Option<String>,
+    /// Pinned server key for caching_sha2_password full auth without TLS.
+    upstream_rsa_public_key: Option<crate::auth::PinnedRsaKey>,
 }
 
 impl TerminatingAuth {
@@ -1660,6 +1663,16 @@ impl TerminatingAuth {
                     resolved.client_auth_plugin
                 )
             })?;
+        // Parsed at startup so a bad key fails the boot, not the first login
+        // after the server's auth cache empties.
+        let upstream_rsa_public_key = resolved
+            .upstream_rsa_public_key
+            .as_deref()
+            .map(|pem| {
+                crate::auth::parse_rsa_public_key(pem)
+                    .map_err(|e| anyhow::anyhow!("auth.upstream_rsa_public_key: {e}"))
+            })
+            .transpose()?;
         Ok(Self {
             client_username: resolved.client_username.clone(),
             client_password: resolved.client_password.clone(),
@@ -1667,6 +1680,7 @@ impl TerminatingAuth {
             upstream_username: resolved.upstream_username.clone(),
             upstream_password: resolved.upstream_password.clone(),
             upstream_database: resolved.upstream_database.clone(),
+            upstream_rsa_public_key,
         })
     }
 }
@@ -1845,6 +1859,7 @@ async fn authenticate_upstream(
         .await?;
 
     let mut rounds = 0;
+    let mut sent_rsa = false;
     loop {
         rounds += 1;
         if rounds > 20 {
@@ -1854,8 +1869,16 @@ async fn authenticate_upstream(
         match auth_step(cancel, "the upstream auth response", upstream_framed.next()).await? {
             Some(Ok(MySqlMessage::Ok(_))) => return Ok(()),
             Some(Ok(MySqlMessage::Err(e))) => {
+                // A server that can't decrypt the RSA reply answers with a plain
+                // access-denied; say what else it may mean.
+                let hint = if sent_rsa {
+                    " (sent via RSA full auth: if the password is right, the server's RSA key \
+                     pair may have changed — re-pin auth.upstream_rsa_public_key)"
+                } else {
+                    ""
+                };
                 anyhow::bail!(
-                    "upstream rejected the proxy credential for user '{}': {} ({})",
+                    "upstream rejected the proxy credential for user '{}': {} ({}){hint}",
                     auth.upstream_username,
                     e.error_message,
                     e.error_code
@@ -1890,19 +1913,28 @@ async fn authenticate_upstream(
                     // reply from us.
                     Some(crate::auth::AuthMoreData::FastAuthSuccess) => continue,
                     Some(crate::auth::AuthMoreData::FullAuthRequired) => {
-                        // Full auth sends the password in the clear. MySQL only
-                        // accepts that on a secure channel, and iron-veil will
-                        // not send it on an insecure one regardless.
-                        if !tls {
+                        // The server has no cached hash (first login, or after a
+                        // restart / FLUSH PRIVILEGES / ALTER USER). Over TLS the
+                        // password goes as cleartext; otherwise only RSA-encrypted
+                        // under the pinned server key — never in the clear.
+                        let payload = if tls {
+                            crate::auth::build_cleartext_password(&auth.upstream_password)
+                        } else if let Some(key) = &auth.upstream_rsa_public_key {
+                            sent_rsa = true;
+                            crate::auth::build_rsa_encrypted_password(
+                                key,
+                                &auth.upstream_password,
+                                &nonce,
+                            )?
+                        } else {
                             anyhow::bail!(
                                 "upstream requires full authentication for user '{}' but \
-                                 upstream_tls is false; full auth transmits the password in \
-                                 cleartext, so set upstream_tls: true",
+                                 upstream_tls is false and no RSA key is pinned; set \
+                                 upstream_tls: true, or pin the server's public key with \
+                                 auth.upstream_rsa_public_key_file",
                                 auth.upstream_username
                             );
-                        }
-                        let payload =
-                            crate::auth::build_cleartext_password(&auth.upstream_password);
+                        };
                         upstream_framed
                             .send(MySqlMessage::Generic(
                                 crate::protocol::mysql::GenericPacket {
@@ -2483,9 +2515,9 @@ fn load_keys(path: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamPoolAcquireError, UpstreamSlotManager, auth_step, build_mysql_err_packet,
-        build_postgres_fatal_error_packet, drain_connections, negotiate_upstream_capabilities,
-        redact_sql_literals, resolve_timeout_limits,
+        TerminatingAuth, UpstreamPoolAcquireError, UpstreamSlotManager, auth_step,
+        build_mysql_err_packet, build_postgres_fatal_error_packet, drain_connections,
+        negotiate_upstream_capabilities, redact_sql_literals, resolve_timeout_limits,
     };
     use crate::config::LimitsConfig;
     use anyhow::Result;
@@ -2496,6 +2528,27 @@ mod tests {
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
     use tokio_util::sync::CancellationToken;
+
+    fn resolved_auth(rsa_pem: Option<&str>) -> crate::config::ResolvedAuth {
+        crate::config::ResolvedAuth {
+            client_username: "door".into(),
+            client_password: "local".into(),
+            client_auth_plugin: "caching_sha2_password".into(),
+            upstream_username: "support_ro".into(),
+            upstream_password: "pw".into(),
+            upstream_database: None,
+            upstream_rsa_public_key: rsa_pem.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_bad_pinned_rsa_key_fails_at_startup() {
+        assert!(TerminatingAuth::from_resolved(&resolved_auth(None)).is_ok());
+        let err = TerminatingAuth::from_resolved(&resolved_auth(Some("garbage")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("auth.upstream_rsa_public_key"), "got: {err}");
+    }
 
     #[test]
     fn test_build_postgres_fatal_error_packet_format() {

@@ -4,6 +4,27 @@ All notable changes to IronVeil are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project follows semantic versioning.
 
+## [0.4.0]
+
+### Added
+
+- **`caching_sha2_password` full authentication without TLS** in
+  `auth.mode: terminate`. When MySQL has no cached hash for the proxy's
+  upstream account (first login, and after every restart, `FLUSH PRIVILEGES`
+  or `ALTER USER`), iron-veil now answers full auth over a non-TLS upstream by
+  RSA-OAEP encrypting the nonce-XORed password under a **pinned** server public
+  key: `auth.upstream_rsa_public_key` / `auth.upstream_rsa_public_key_file` /
+  `IRONVEIL_UPSTREAM_RSA_PUBLIC_KEY`. The key is validated at startup and never
+  taken from the wire. This makes MySQL 8.4+/9.x accounts work without
+  `mysql_native_password`, which MySQL 9 removed.
+- e2e suite against MySQL 9.7: uncached, cached and re-flushed logins over RSA,
+  plus fail-closed checks for a wrong pinned key and for no key without TLS.
+
+### Changed
+
+- The startup warning for terminate mode without `upstream_tls` now only fires
+  when no RSA key is pinned, and names both fixes.
+
 ## [0.3.0]
 
 Hardening for the sidecar deployment shape: a credential boundary, a
